@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LifeOS — Privacy Policy</title>
+<style>
+  body{background:#090909;color:#E8E6E1;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+    max-width:720px;margin:0 auto;padding:48px 24px;line-height:1.7;font-size:15px}
+  h1{font-size:22px;color:#D4A843} h2{font-size:15px;margin-top:32px;color:#D4A843;letter-spacing:.03em}
+  a{color:#4B9E82} .muted{color:#8A877F;font-size:13px} li{margin:6px 0}
+</style>
+</head>
+<body>
+<h1>LifeOS — Privacy Policy</h1>
+<p class="muted">Last updated: 16 July 2026</p>
+
+<p>LifeOS is a personal data-management application. This policy describes what
+data it handles, where that data lives, and how to remove it. The short
+version: <b>your data lives in your own accounts</b> — your own Cloudflare
+account, your own Notion workspace, your own browser — not on our servers.</p>
+
+<h2>1. Architecture — why most of your data never touches us</h2>
+<p>LifeOS requires every user to connect their own Cloudflare account. During
+setup, LifeOS deploys a private backend (a Cloudflare Worker and database)
+<b>inside your Cloudflare account</b>. From that point on, your credentials,
+configuration, and automations run on infrastructure you own and we cannot
+access. Our shared server (the "orchestrator") only handles sign-in and that
+initial setup.</p>
+
+<h2>2. Data we process</h2>
+<ul>
+<li><b>Account:</b> when you sign in with Google we store your Google account
+ID, email address, and display name.</li>
+<li><b>Service credentials:</b> tokens for services you choose to connect
+(Google Calendar, Gmail, Notion, Canvas, monday.com, Google Gemini, ntfy).
+These are encrypted (AES-256-GCM) before storage and are write-only — the
+app can use them on your behalf but never displays them back. Once your own
+backend is deployed, they are moved into your Cloudflare account and deleted
+from ours.</li>
+<li><b>Email:</b> if you connect Gmail, message content is read (read-only
+scope) and passed transiently to Google's Gemini API to flag items for your
+daily digest. Email content is not stored by LifeOS.</li>
+<li><b>Calendar and Notion content:</b> read and written on your instruction
+(sync, import, digest). Stored in your Notion workspace and your browser,
+not on our servers.</li>
+<li><b>Projects, pages, tables, notes:</b> stored in your browser
+(localStorage) and, if you sync them, in your own Notion workspace.</li>
+<li><b>Automations you create</b> (watch jobs, upload formats, queued
+uploads): stored in your own backend's database.</li>
+<li><b>Security telemetry:</b> to rate-limit sign-in abuse, a hashed
+(SHA-256) form of the connecting IP address is kept briefly. Raw IP
+addresses are not stored.</li>
+<li><b>Weather:</b> the city you choose is sent to Open-Meteo from your
+browser to fetch forecasts. It is not tied to your account.</li>
+</ul>
+
+<h2>3. What we do NOT do</h2>
+<ul>
+<li>No advertising, no trackers, no analytics scripts.</li>
+<li>No selling or sharing of personal data with third parties.</li>
+<li>No reading of your files or messages beyond the features you invoke.</li>
+<li>No compression or modification of files you upload through the Uploader —
+files are transferred as-is.</li>
+</ul>
+
+<h2>4. Third-party services</h2>
+<p>LifeOS talks to services on your instruction, under their own privacy
+policies: Google (sign-in, Calendar, Gmail, Gemini, YouTube),
+Notion, Cloudflare, Canvas/Instructure, monday.com, ntfy.sh, Open-Meteo, and —
+if you use the Uploader — TikTok, Meta (Instagram), and SoundCloud.
+LifeOS's use of information received from Google APIs adheres to the
+<a href="https://developers.google.com/terms/api-services-user-data-policy">Google
+API Services User Data Policy</a>, including the Limited Use requirements.</p>
+
+<h2>5. Data retention and deletion</h2>
+<ul>
+<li><b>Delete your account</b> any time in Settings → delete account. This
+permanently removes your account record, encrypted credentials, configuration,
+and queued jobs from LifeOS.</li>
+<li>Your own Cloudflare Worker and database belong to you — remove them from
+your Cloudflare dashboard whenever you like.</li>
+<li>Data in your Notion workspace and browser localStorage is yours and is
+never held by us.</li>
+<li>Sessions expire after 30 days; sign-out deletes them immediately.</li>
+</ul>
+
+<h2>6. Security</h2>
+<p>Credentials are encrypted at rest with AES-256-GCM; session tokens are
+stored only as SHA-256 hashes; all traffic is HTTPS; OAuth endpoints are
+rate-limited. Full details are published in the project's SECURITY
+documentation.</p>
+
+<h2>7. Children</h2>
+<p>LifeOS is not directed at children under 13 (or the applicable age of
+digital consent in your country) and should not be used by them.</p>
+
+<h2>8. Your rights</h2>
+<p>Depending on where you live (including under UK/EU GDPR), you may have
+rights to access, correct, export, or erase your personal data. Because
+almost all data lives in accounts you directly control, you can exercise
+most of these yourself immediately; for anything else, contact us.</p>
+
+<h2>9. Changes and contact</h2>
+<p>Material changes to this policy will be reflected on this page with an
+updated date. Questions or requests:
+<a href="mailto:matthewujunwawork@gmail.com">matthewujunwawork@gmail.com</a>.</p>
+</body>
+</html>

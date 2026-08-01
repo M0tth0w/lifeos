@@ -1,0 +1,16 @@
+name = "lifeos-api"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+[vars]
+# These get filled in by deploy.sh automatically — don't edit by hand
+APP_URL = "https://lifeos-dashboard-9ji.pages.dev"
+WORKER_SOURCE_URL = "https://lifeos-dashboard-9ji.pages.dev"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "lifeos"
+database_id = "bfa3ff5c-8805-4858-9811-ab58677478f6"
+
+[triggers]
+crons = ["0 7 * * *", "0 12 * * *"]
