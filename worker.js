@@ -1055,7 +1055,7 @@ export default {
       const headers = new Headers({ Location: env.APP_URL });
       headers.append(
         "Set-Cookie",
-        `${SESSION_COOKIE}=${sessionToken}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${SESSION_TTL_MS / 1000}`
+        `${SESSION_COOKIE}=${sessionToken}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=${SESSION_TTL_MS / 1000}`
       );
       return new Response(null, { status: 302, headers });
     }
@@ -1064,7 +1064,7 @@ export default {
       const token = getCookie(request, SESSION_COOKIE);
       if (token) await env.DB.prepare("DELETE FROM sessions WHERE token_hash = ?").bind(await sha256Hex(token)).run();
       const headers = new Headers({ "Content-Type": "application/json", ...corsHeaders(env) });
-      headers.append("Set-Cookie", `${SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`);
+      headers.append("Set-Cookie", `${SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=0`);
       return new Response(JSON.stringify({ ok: true }), { status: 200, headers });
     }
 
@@ -1081,7 +1081,7 @@ export default {
       if (!user) return json(env, { error: "Not authenticated" }, 401);
       await env.DB.prepare("DELETE FROM users WHERE id = ?").bind(user.id).run();
       const headers = new Headers({ "Content-Type": "application/json", ...corsHeaders(env) });
-      headers.append("Set-Cookie", `${SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`);
+      headers.append("Set-Cookie", `${SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=0`);
       return new Response(JSON.stringify({ ok: true, deleted: true }), { status: 200, headers });
     }
 
