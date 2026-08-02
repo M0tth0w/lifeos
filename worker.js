@@ -966,7 +966,7 @@ export default {
 
       const params = new URLSearchParams({
         client_id: env.GOOGLE_CLIENT_ID,
-        redirect_uri: `${env.WORKER_URL}/auth/google/callback`,
+        redirect_uri: `${env.APP_WORKER_URL}/auth/google/callback`,
         response_type: "code",
         scope: scopes.join(" "),
         state,
@@ -997,7 +997,7 @@ export default {
           code,
           code_verifier: stateRow.code_verifier,
           grant_type: "authorization_code",
-          redirect_uri: `${env.WORKER_URL}/auth/google/callback`,
+          redirect_uri: `${env.APP_WORKER_URL}/auth/google/callback`,
         }),
       });
       const tokens = await tokenResp.json();
@@ -1189,7 +1189,7 @@ export default {
         .run();
       const params = new URLSearchParams({
         client_id: env.NOTION_CLIENT_ID,
-        redirect_uri: `${env.WORKER_URL}/oauth/notion/callback`,
+        redirect_uri: `${env.APP_WORKER_URL}/oauth/notion/callback`,
         response_type: "code",
         owner: "user",
         state,
@@ -1210,7 +1210,7 @@ export default {
           Authorization: `Basic ${btoa(`${env.NOTION_CLIENT_ID}:${env.NOTION_CLIENT_SECRET}`)}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ grant_type: "authorization_code", code, redirect_uri: `${env.WORKER_URL}/oauth/notion/callback` }),
+        body: JSON.stringify({ grant_type: "authorization_code", code, redirect_uri: `${env.APP_WORKER_URL}/oauth/notion/callback` }),
       });
       const tokens = await resp.json();
       if (!resp.ok) return json(env, { error: "Notion token exchange failed", detail: tokens }, 400);
@@ -1242,7 +1242,7 @@ export default {
 
       const params = new URLSearchParams({
         client_id: env.CLOUDFLARE_CLIENT_ID,
-        redirect_uri: `${env.WORKER_URL}/oauth/cloudflare/callback`,
+        redirect_uri: `${env.APP_WORKER_URL}/oauth/cloudflare/callback`,
         response_type: "code",
         state,
         code_challenge: codeChallenge,
@@ -1274,7 +1274,7 @@ export default {
           code,
           code_verifier: stateRow.code_verifier,
           grant_type: "authorization_code",
-          redirect_uri: `${env.WORKER_URL}/oauth/cloudflare/callback`,
+          redirect_uri: `${env.APP_WORKER_URL}/oauth/cloudflare/callback`,
         }),
       });
       const tokens = await tokenResp.json();
