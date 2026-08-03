@@ -1101,7 +1101,7 @@ export default {
           deploymentInfo = { worker_url: deployment.value, relay_token: await mintRelayToken(relay.secret, user.id) };
         }
       }
-      return json(env, { user, deployment: deploymentInfo });
+      return json(env, { user, deployment: deploymentInfo, operator_mode: env.OPERATOR_MODE === "true" });
     }
 
     // ── Mandatory bring-your-own-Cloudflare ──────────────────────────────────

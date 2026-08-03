@@ -26,7 +26,7 @@ import {
 // the site and signs in — no URL, no setup, no homework. An override still
 // exists (Settings → Advanced) for anyone who wants to point at their own
 // orchestrator deployment instead, but it's hidden by default.
-const DEFAULT_API_BASE = "https://lifeos-api.matthewujunwawork.workers.dev" // e.g. "https://lifeos-api.you.workers.dev" — set once, ship it
+const DEFAULT_API_BASE = "" // e.g. "https://lifeos-api.you.workers.dev" — set once, ship it
 
 // Feature flags — the Uploader stays built but hidden until platform API
 // approvals land. Flip to true to ship it; nothing else needs to change.
@@ -3556,7 +3556,7 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
     ]
     const credStatus = (svc)=>creds.find(c=>c.service===svc)
     const cf = credStatus("cloudflare")
-    const deployed = !!me?.deployment?.worker_url
+    const deployed = !!me?.deployment?.worker_url || !!me?.operator_mode
 
     return (
       <div style={{overflowY:"auto",padding:"24px 28px",maxWidth:"640px"}} className="fi">
@@ -3629,7 +3629,12 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
             <div style={{marginBottom:"24px"}}>
               <Eyebrow style={{marginBottom:"10px"}}>YOUR INFRASTRUCTURE{!deployed&&" — REQUIRED"}</Eyebrow>
               <div style={{background:"var(--s1)",border:deployed?"1px solid var(--b)":"1px solid rgba(212,168,67,.4)",borderRadius:"8px",padding:"14px"}}>
-                {deployed?(
+                {me?.operator_mode?(
+                  <>
+                    <div style={{fontSize:"12px",color:"var(--teal)",marginBottom:"5px"}}>✓ Operator mode — running on the shared backend</div>
+                    <div style={{fontSize:"10px",color:"var(--m)"}}>You're using LifeOS's own deployment directly. Other users will each connect their own Cloudflare account.</div>
+                  </>
+                ):deployed?(
                   <>
                     <div style={{fontSize:"12px",color:"var(--teal)",marginBottom:"5px"}}>✓ Running on your own Cloudflare account</div>
                     <div style={{fontSize:"10px",fontFamily:"var(--mono)",color:"var(--d)"}}>{me.deployment.worker_url}</div>
