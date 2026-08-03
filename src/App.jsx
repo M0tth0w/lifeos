@@ -16,7 +16,7 @@ import {
   // Projects-upgrade icons
   Bug, List, LayoutGrid, BarChart3, GripVertical,
   CloudRain, CloudSnow, CloudLightning, CloudDrizzle, CloudFog, MapPin, RotateCw,
-  Download
+  Download, ListChecks
 } from "lucide-react"
 
 // ─── Shared backend ───────────────────────────────────────────────────────────
@@ -265,6 +265,7 @@ const NAV_ITEMS = [
   { id:"projects",  Icon:Layers,          label:"Projects" },
   { id:"files",     Icon:FolderOpen,      label:"Files" },
   { id:"calendar",  Icon:CalendarDays,    label:"Calendar" },
+  { id:"upcoming",  Icon:ListChecks,      label:"Upcoming" },
   { id:"digest",    Icon:AlignLeft,       label:"Digest" },
   ...(UPLOADER_ENABLED?[{ id:"uploader",  Icon:Rocket,  label:"Uploader" }]:[]),
   { id:"settings",  Icon:Settings,        label:"Settings" },
@@ -460,6 +461,19 @@ function daysUntilLabel(dateStr){
   if(days===0) return "today"
   if(days===1) return "tomorrow"
   if(days<0) return "past"
+  return `${days}d`
+}
+// Hours-precision label for anything with a real datetime (not just a date) —
+// "in 3h" reads very differently from "today" when the deadline is at 11pm.
+function untilLabel(dt){
+  const target=new Date(dt), now=new Date()
+  const ms=target-now
+  if(ms<0) return "past"
+  const hours=ms/3600000
+  if(hours<1) return `${Math.max(1,Math.round(ms/60000))}m`
+  if(hours<24) return `${Math.round(hours)}h`
+  const days=Math.floor(hours/24)
+  if(days===1) return "tomorrow"
   return `${days}d`
 }
 const DEFAULT_EVENT_DURATION_MIN = 60 // fallback when an event has no end time
@@ -2568,6 +2582,31 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
     })
   }
 
+  async function notionCalUpdate(pageId, event) {
+    if (!apiBase || !creds.some(c=>c.service==="notion")) throw new Error("Connect Notion in Settings first.")
+    const dateStr = event.time ? `${event.date}T${event.time}:00` : event.date
+    const endStr = event.endTime && event.time ? `${event.date}T${event.endTime}:00` : undefined
+    const body = {
+      properties: {
+        Name: { title: [{ text: { content: event.title } }] },
+        Date: { date: { start: dateStr, end: endStr, is_datetime: !!event.time } },
+        Type: { select: { name: event.type || "Event" } },
+        ...(event.module!==undefined && { Module: { rich_text: event.module?[{ text: { content: event.module } }]:[] } }),
+        ...(event.room!==undefined && { Room: { rich_text: event.room?[{ text: { content: event.room } }]:[] } }),
+        ...(event.notes!==undefined && { Notes: { rich_text: event.notes?[{ text: { content: event.notes } }]:[] } }),
+      }
+    }
+    const r = await backendFetch(`/proxy/notion/v1/pages/${pageId}`, { method: "PATCH", body: JSON.stringify(body) })
+    if (!r.ok) { const e = await r.json().catch(()=>({})); throw new Error(e?.message || `Notion ${r.status}`) }
+    return r.json()
+  }
+  async function notionCalDelete(pageId) {
+    if (!apiBase || !creds.some(c=>c.service==="notion")) throw new Error("Connect Notion in Settings first.")
+    const r = await backendFetch(`/proxy/notion/v1/pages/${pageId}`, { method: "PATCH", body: JSON.stringify({ archived: true }) })
+    if (!r.ok) { const e = await r.json().catch(()=>({})); throw new Error(e?.message || `Notion ${r.status}`) }
+    return r.json()
+  }
+
   async function notionCalCreate(event) {
     if (!apiBase || !creds.some(c=>c.service==="notion")) throw new Error("Connect Notion in Settings first.")
     const dateStr = event.time ? `${event.date}T${event.time}:00` : event.date
@@ -2634,6 +2673,33 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
     const [addingType,setAddingType]=useState(false)
     const [newTypeName,setNewTypeName]=useState("")
     const [newTypeColor,setNewTypeColor]=useState("blue")
+    const [editEvent,setEditEvent]=useState(null)   // event object currently open for streamlined editing
+    const [editSaving,setEditSaving]=useState(false)
+    const [editSavedFlash,setEditSavedFlash]=useState(false)
+
+    async function saveEditField(changes){
+      if(!editEvent?.id) return
+      setEditSaving(true)
+      try{
+        const merged={...editEvent,...changes}
+        setEditEvent(merged)
+        await notionCalUpdate(editEvent.id, merged)
+        setEditSavedFlash(true); setTimeout(()=>setEditSavedFlash(false),1200)
+        const start=ymd(weekStart),end=ymd(addD(weekStart,8))
+        notionCalQuery(start,end).then(setNotionEvents).catch(()=>{})
+      }catch(e){ flash("Couldn't save: "+e.message,"warn") }
+      finally{ setEditSaving(false) }
+    }
+    async function deleteEditEvent(){
+      if(!editEvent?.id) return
+      if(!confirm(`Delete "${editEvent.title}"?`)) return
+      try{
+        await notionCalDelete(editEvent.id)
+        setEditEvent(null)
+        const start=ymd(weekStart),end=ymd(addD(weekStart,8))
+        notionCalQuery(start,end).then(setNotionEvents).catch(()=>{})
+      }catch(e){ flash("Couldn't delete: "+e.message,"warn") }
+    }
 
 
     const weekStart=getMon(addD(new Date(),wOff*7))
@@ -2730,12 +2796,12 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
                   {dayEvts.length===0&&!loading&&<div style={{fontSize:"9px",color:"var(--m)",fontFamily:"var(--mono)"}}>—</div>}
                   {dayEvts.map(ev=>(
                     <div key={ev.id||ev.title+ev.date}
-                      onClick={()=>ev.notion_url&&window.open(ev.notion_url,"_blank")}
-                      title={`${ev.title}${ev.room?" · "+ev.room:""}${ev.time?" · "+ev.time:""}`}
+                      onClick={()=>ev.id?setEditEvent(ev):ev.notion_url&&window.open(ev.notion_url,"_blank")}
+                      title={`${ev.title}${ev.room?" · "+ev.room:""}${ev.time?" · "+ev.time:""}${ev.id?" — click to edit":""}`}
                       style={{fontSize:"9px",padding:"3px 5px",borderRadius:"3px",lineHeight:"1.4",wordBreak:"break-word",
                         background:(ev.color||"var(--teal)")+"1A",color:ev.color||"var(--teal)",
                         borderLeft:"2px solid "+(ev.color||"var(--teal)"),
-                        cursor:ev.notion_url?"pointer":"default"}}>
+                        cursor:(ev.id||ev.notion_url)?"pointer":"default"}}>
                       {ev.time&&<span style={{fontFamily:"var(--mono)",opacity:.8,marginRight:"3px"}}>{ev.time}</span>}
                       {ev.title.length>22?ev.title.slice(0,20)+"…":ev.title}
                     </div>
@@ -2745,6 +2811,62 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
             )
           })}
         </div>
+
+        {/* Edit event — streamlined: click a field, click away, it's saved. No submit button. */}
+        {editEvent&&(
+          <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.75)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}}
+            onClick={()=>setEditEvent(null)}>
+            <div onClick={e=>e.stopPropagation()} style={{background:"var(--s1)",border:"1px solid var(--b)",borderRadius:"10px",padding:"20px",width:"380px"}} className="fi">
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"14px"}}>
+                <Eyebrow>{editSaving?"SAVING…":editSavedFlash?"SAVED ✓":"EDIT EVENT"}</Eyebrow>
+                <div style={{display:"flex",gap:"8px",alignItems:"center"}}>
+                  {editEvent.notion_url&&<a href={editEvent.notion_url} target="_blank" rel="noreferrer" style={{fontSize:"10px",color:"var(--m)"}}>notion ↗</a>}
+                  <button onClick={()=>setEditEvent(null)} style={{background:"none",border:"none",cursor:"pointer",color:"var(--m)",padding:0,display:"flex"}}><X size={14}/></button>
+                </div>
+              </div>
+              <input defaultValue={editEvent.title} onBlur={e=>{if(e.target.value.trim()&&e.target.value!==editEvent.title) saveEditField({title:e.target.value})}}
+                placeholder="Event title" style={{width:"100%",background:"var(--s2)",color:"var(--t)",border:"1px solid var(--b)",borderRadius:"6px",padding:"9px 10px",fontSize:"14px",marginBottom:"10px"}}/>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"7px",marginBottom:"10px"}}>
+                <div>
+                  <Eyebrow style={{marginBottom:"3px"}}>DATE</Eyebrow>
+                  <input type="date" defaultValue={editEvent.date} onBlur={e=>e.target.value&&e.target.value!==editEvent.date&&saveEditField({date:e.target.value})}
+                    style={{width:"100%",background:"var(--s2)",color:"var(--t)",border:"1px solid var(--b)",borderRadius:"6px",padding:"7px 8px",fontSize:"11px"}}/>
+                </div>
+                <div>
+                  <Eyebrow style={{marginBottom:"3px"}}>TIME</Eyebrow>
+                  <input type="time" defaultValue={editEvent.time||""} onBlur={e=>e.target.value!==(editEvent.time||"")&&saveEditField({time:e.target.value})}
+                    style={{width:"100%",background:"var(--s2)",color:"var(--t)",border:"1px solid var(--b)",borderRadius:"6px",padding:"7px 8px",fontSize:"11px"}}/>
+                </div>
+                <div>
+                  <Eyebrow style={{marginBottom:"3px"}}>UNTIL</Eyebrow>
+                  <input type="time" defaultValue={editEvent.endTime||""} onBlur={e=>e.target.value!==(editEvent.endTime||"")&&saveEditField({endTime:e.target.value})}
+                    style={{width:"100%",background:"var(--s2)",color:"var(--t)",border:"1px solid var(--b)",borderRadius:"6px",padding:"7px 8px",fontSize:"11px"}}/>
+                </div>
+              </div>
+              <Eyebrow style={{marginBottom:"5px"}}>TYPE</Eyebrow>
+              <div style={{display:"flex",flexWrap:"wrap",gap:"5px",marginBottom:"10px"}}>
+                {eventTypes.map(t=>(
+                  <button key={t.name} type="button" onClick={()=>saveEditField({type:t.name})}
+                    style={{fontSize:"10px",fontFamily:"var(--mono)",padding:"4px 8px",borderRadius:"4px",border:"1px solid",cursor:"pointer",
+                      borderColor:editEvent.type===t.name?t.hex:"var(--b)",
+                      background:editEvent.type===t.name?t.hex+"22":"transparent",
+                      color:editEvent.type===t.name?t.hex:"var(--d)"}}>
+                    {t.name}
+                  </button>
+                ))}
+              </div>
+              <input defaultValue={editEvent.room||""} onBlur={e=>e.target.value!==(editEvent.room||"")&&saveEditField({room:e.target.value})}
+                placeholder="Room / location (optional)" style={{width:"100%",background:"var(--s2)",color:"var(--t)",border:"1px solid var(--b)",borderRadius:"6px",padding:"8px 10px",fontSize:"12px",marginBottom:"8px"}}/>
+              <textarea defaultValue={editEvent.notes||""} onBlur={e=>e.target.value!==(editEvent.notes||"")&&saveEditField({notes:e.target.value})}
+                placeholder="Notes (optional)" rows={2}
+                style={{width:"100%",background:"var(--s2)",color:"var(--t)",border:"1px solid var(--b)",borderRadius:"6px",padding:"8px 10px",fontSize:"12px",marginBottom:"14px",resize:"vertical",fontFamily:"inherit"}}/>
+              <button onClick={deleteEditEvent}
+                style={{width:"100%",background:"none",border:"1px solid rgba(224,85,85,.35)",color:"#e05555",borderRadius:"6px",padding:"8px",cursor:"pointer",fontSize:"11px",fontFamily:"var(--mono)"}}>
+                delete event
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Legend */}
         <div style={{display:"flex",gap:"14px",fontSize:"10px",fontFamily:"var(--mono)",color:"var(--d)",flexWrap:"wrap"}}>
@@ -3259,6 +3381,122 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
     youtube:   [{key:"title",label:"Title"},{key:"description",label:"Description"},{key:"tags",label:"Tags"},{key:"visibility",label:"Visibility (public/unlisted)"}],
     soundcloud:[{key:"title",label:"Title"},{key:"description",label:"Description"},{key:"tags",label:"Tags"}],
   }
+  // ─── Upcoming tab — sectioned to-do/deadline view aggregating every
+  // deadline source LifeOS knows about (Notion calendar, Canvas, project
+  // subproject deadlines) into one place, grouped by type or by project,
+  // sorted by closeness with hours-precision when something's due soon.
+  function UpcomingTab(){
+    const [items,setItems]=useState([])
+    const [loading,setLoading]=useState(false)
+    const [groupBy,setGroupBy]=useState("type")   // "type" | "project"
+    const [canvas,setCanvas]=useState(null)
+    const hasNotion=creds.some(c=>c.service==="notion")
+    const hasCanvas=creds.some(c=>c.service==="canvas")
+
+    async function refresh(){
+      setLoading(true)
+      const collected=[]
+      // Notion calendar — next 30 days
+      if(hasNotion){
+        try{
+          const start=ymd(new Date()), end=ymd(addD(new Date(),30))
+          const evs=await notionCalQuery(start,end)
+          evs.forEach(e=>collected.push({
+            id:"ev_"+(e.id||e.title+e.date), kind:e.type||"Event", title:e.title,
+            when:e.time?`${e.date}T${e.time}:00`:e.date+"T23:59:00",
+            dateOnly:!e.time, project:null, color:e.color||"var(--teal)", url:e.notion_url,
+          }))
+        }catch{}
+      }
+      // Canvas deadlines
+      if(hasCanvas){
+        try{
+          const cs=await fetchCanvasSummary()
+          setCanvas(cs)
+          ;(cs?.deadlines||[]).forEach(d=>collected.push({
+            id:"cv_"+d.id, kind:"Canvas", title:d.title+(d.course_name?` — ${d.course_name}`:""),
+            when:d.due_at, dateOnly:false, project:d.course_name, color:"#4B9E82", url:d.html_url,
+          }))
+        }catch{}
+      }
+      // Project subproject deadlines
+      projects.forEach(p=>{
+        (p.subprojects||[]).forEach(sp=>{
+          if(sp.deadline&&sp.status!=="Complete") collected.push({
+            id:"sp_"+sp.id, kind:p.category||"Project", title:sp.title,
+            when:sp.deadline+"T23:59:00", dateOnly:true, project:p.title, color:(categories[p.category]||{}).color||"var(--amber)", url:null,
+          })
+        })
+      })
+      collected.sort((a,b)=>new Date(a.when)-new Date(b.when))
+      setItems(collected.filter(i=>new Date(i.when)>=new Date(Date.now()-86400000)))
+      setLoading(false)
+    }
+    useEffect(()=>{ refresh() },[hasNotion,hasCanvas,projects.length])
+
+    const groups={}
+    items.forEach(i=>{
+      const key = groupBy==="type" ? i.kind : (i.project||"Other")
+      if(!groups[key]) groups[key]=[]
+      groups[key].push(i)
+    })
+    const groupKeys=Object.keys(groups).sort((a,b)=>new Date(groups[a][0].when)-new Date(groups[b][0].when))
+
+    return(
+      <div style={{overflowY:"auto",padding:"22px 26px",maxWidth:"720px"}} className="fi">
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"6px"}}>
+          <Eyebrow>UPCOMING</Eyebrow>
+          <div style={{display:"flex",gap:"5px"}}>
+            {["type","project"].map(g=>(
+              <button key={g} onClick={()=>setGroupBy(g)}
+                style={{fontSize:"10px",fontFamily:"var(--mono)",padding:"3px 9px",borderRadius:"4px",border:"1px solid",cursor:"pointer",
+                  borderColor:groupBy===g?"var(--amber)":"var(--b)",background:groupBy===g?"rgba(212,168,67,.1)":"transparent",
+                  color:groupBy===g?"var(--amber)":"var(--m)"}}>
+                by {g}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div style={{fontSize:"11px",color:"var(--d)",marginBottom:"18px"}}>
+          Everything due in the next 30 days — calendar, coursework, and project deadlines in one place.
+        </div>
+        {loading&&<div style={{fontSize:"11px",color:"var(--m)",fontStyle:"italic"}}>Loading…</div>}
+        {!loading&&!items.length&&<div style={{fontSize:"11px",color:"var(--m)",fontStyle:"italic"}}>Nothing upcoming — clear for 30 days.</div>}
+        {!loading&&groupKeys.map(key=>(
+          <div key={key} style={{marginBottom:"20px"}}>
+            <div style={{fontSize:"10px",fontFamily:"var(--mono)",color:"var(--d)",marginBottom:"8px",textTransform:"uppercase",letterSpacing:".04em"}}>{key}</div>
+            <div style={{display:"flex",flexDirection:"column",gap:"5px"}}>
+              {groups[key].map(item=>{
+                const label=untilLabel(item.when)
+                const urgent=label.endsWith("m")||label.endsWith("h")||label==="today"
+                const soon=urgent||label==="tomorrow"
+                const Wrap=item.url?"a":"div"
+                return(
+                  <Wrap key={item.id} {...(item.url?{href:item.url,target:"_blank",rel:"noreferrer"}:{})}
+                    style={{display:"flex",alignItems:"center",gap:"10px",background:"var(--s1)",
+                      border:`1px solid ${urgent?"rgba(224,85,85,.3)":soon?"rgba(212,168,67,.25)":"var(--b)"}`,
+                      borderRadius:"7px",padding:"9px 12px",textDecoration:"none",cursor:item.url?"pointer":"default"}}>
+                    <span style={{width:"4px",height:"4px",borderRadius:"50%",background:item.color,flexShrink:0}}/>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontSize:"12px",color:"var(--t)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{item.title}</div>
+                      {groupBy==="type"&&item.project&&<div style={{fontSize:"9px",fontFamily:"var(--mono)",color:"var(--m)"}}>{item.project}</div>}
+                      {groupBy==="project"&&<div style={{fontSize:"9px",fontFamily:"var(--mono)",color:"var(--m)"}}>{item.kind}</div>}
+                    </div>
+                    {!item.dateOnly&&<span style={{fontSize:"9px",fontFamily:"var(--mono)",color:"var(--m)"}}>{new Date(item.when).toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})}</span>}
+                    <span style={{fontSize:"10px",fontFamily:"var(--mono)",fontWeight:urgent?"600":"400",
+                      color:urgent?"#e05555":soon?"var(--amber)":"var(--d)",flexShrink:0,minWidth:"38px",textAlign:"right"}}>
+                      {label}
+                    </span>
+                  </Wrap>
+                )
+              })}
+            </div>
+          </div>
+        ))}
+      </div>
+    )
+  }
+
   function UploaderTab(){
     const [formats,setFormats]=useState([])
     const [jobs,setJobs]=useState([])
@@ -3745,6 +3983,7 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
     projects:<Projects/>,
     files:<Files/>,
     calendar:<CalendarView/>,
+    upcoming:<UpcomingTab/>,
     digest:<DigestView/>,
     uploader:<UploaderTab/>,
     settings:<SettingsTab/>,
