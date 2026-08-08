@@ -1543,6 +1543,88 @@ export default {
       return json(env, { text });
     }
 
+    // ── Link preview — fetches a saved link's page metadata server-side (the
+    // browser can't do this itself: arbitrary cross-origin HTML fetches are
+    // blocked by CORS on almost every real site). Returns just enough for a
+    // quick preview card: title, description, image, favicon. No JS execution,
+    // no full-page render — a plain HTML fetch with regex metadata extraction,
+    // which is the standard lightweight approach for link unfurls.
+    if (path === "/api/link-preview" && request.method === "GET") {
+      const user = await getSessionUser(request, env);
+      if (!user) return json(env, { error: "Not authenticated" }, 401);
+      if (!(await checkRateLimit(env, `linkpreview:${user.id}`, 60, 10 * 60 * 1000))) {
+        return json(env, { error: "Too many preview requests — try again shortly." }, 429);
+      }
+      const target = url.searchParams.get("url");
+      if (!target) return json(env, { error: "url query param required" }, 400);
+
+      let parsed;
+      try { parsed = new URL(target); } catch { return json(env, { error: "Invalid URL" }, 400); }
+      if (!["http:", "https:"].includes(parsed.protocol)) {
+        return json(env, { error: "Only http/https URLs are allowed" }, 400);
+      }
+      // Basic SSRF guard — block obviously-internal targets. Cloudflare's edge
+      // fetch doesn't reach a user's private network the way a normal server
+      // would, but this costs nothing and closes the obvious cases.
+      const host = parsed.hostname.toLowerCase();
+      if (host === "localhost" || host.startsWith("127.") || host.startsWith("169.254.") ||
+          host.startsWith("10.") || host.startsWith("192.168.") || /^172\.(1[6-9]|2\d|3[01])\./.test(host)) {
+        return json(env, { error: "That host isn't allowed" }, 400);
+      }
+
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 6000);
+        const resp = await fetch(target, {
+          signal: controller.signal,
+          headers: { "User-Agent": "Mozilla/5.0 (compatible; LifeOS-LinkPreview/1.0)" },
+        });
+        clearTimeout(timeout);
+        if (!resp.ok) return json(env, { error: `Site returned ${resp.status}`, domain: parsed.hostname }, 200);
+
+        // Only read the first chunk — metadata always lives in <head>, no
+        // need to download a whole multi-MB page to find it.
+        const reader = resp.body.getReader();
+        let html = "", bytesRead = 0;
+        const MAX_BYTES = 100_000;
+        while (bytesRead < MAX_BYTES) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          html += new TextDecoder().decode(value, { stream: true });
+          bytesRead += value.length;
+          if (html.includes("</head>")) break;
+        }
+        reader.cancel().catch(() => {});
+
+        const grab = (re) => (html.match(re) || [])[1]?.trim();
+        const title = grab(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i)
+          || grab(/<title[^>]*>([^<]+)<\/title>/i);
+        const description = grab(/<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["']/i)
+          || grab(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i);
+        let image = grab(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i);
+        if (image && !image.startsWith("http")) {
+          image = new URL(image, target).href; // resolve relative og:image URLs
+        }
+
+        return json(env, {
+          title: title || parsed.hostname,
+          description: description || null,
+          image: image || null,
+          favicon: `https://www.google.com/s2/favicons?domain=${parsed.hostname}&sz=64`,
+          domain: parsed.hostname,
+        });
+      } catch (e) {
+        // Fetch failed (timeout, blocked, DNS, etc) — still return something
+        // useful (domain + favicon) rather than a bare error the UI has to
+        // special-case.
+        return json(env, {
+          title: parsed.hostname, description: null, image: null,
+          favicon: `https://www.google.com/s2/favicons?domain=${parsed.hostname}&sz=64`,
+          domain: parsed.hostname, fetchFailed: true,
+        });
+      }
+    }
+
     if (path === "/api/scrape" && request.method === "POST") {
       const user = await getSessionUser(request, env);
       if (!user) return json(env, { error: "Not authenticated" }, 401);

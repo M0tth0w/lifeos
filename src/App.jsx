@@ -16,7 +16,7 @@ import {
   // Projects-upgrade icons
   Bug, List, LayoutGrid, BarChart3, GripVertical,
   CloudRain, CloudSnow, CloudLightning, CloudDrizzle, CloudFog, MapPin, RotateCw,
-  Download, ListChecks
+  Download, ListChecks, Eye, CalendarRange
 } from "lucide-react"
 
 // ─── Shared backend ───────────────────────────────────────────────────────────
@@ -96,6 +96,7 @@ const SECTION_DEFS = {
   notes:     { label:"Notes",              Icon:AlignLeft },
   tables:    { label:"Tables",             Icon:LayoutGrid },
   charts:    { label:"Charts",             Icon:BarChart3 },
+  timeline:  { label:"Timeline",           Icon:CalendarRange },
 }
 const LINK_SUGGESTIONS = ["CAD file (Onshape/Fusion)","GitHub repo","Figma board","Google Doc","Tutorial / reference","Shared drive folder","Spotify / SoundCloud track","Product listing"]
 
@@ -207,6 +208,50 @@ const PRIORITY_ORDER = { high:0, medium:1, low:2 }
 function taskDefaults(t){
   return { priority:"medium", milestone:false, kind:"task", start:null, ...t }
 }
+// ─── Canonical constructors — full modularity ──────────────────────────────
+// Every project/page node, however and wherever it's created (the "+ new
+// project" button, "+ sub-project", Notion smart-import, Canvas import, or
+// a natural-language command), gets EXACTLY this shape. Before this existed,
+// five different code paths hand-rolled slightly different object literals —
+// some missing `children`, some missing `tables`/`charts`/`links`, one using
+// an entirely different field name for tasks. That's why "does this project
+// support tables" used to depend on how it was created instead of being
+// always true. One constructor, called everywhere, fixes that at the root.
+function makeNode({ id, type="project", title="Untitled", emoji="📁", category=null, sections, notes="", description="", status="Not started" } = {}){
+  return {
+    id: id || (type==="page" ? "n_" : "p_") + Date.now() + "_" + Math.random().toString(36).slice(2,7),
+    type, title, emoji, category, status, description,
+    sections: sections || (type==="page" ? ["notes"] : ["tasks"]),
+    notion_url: null, notion_page_id: null, notion_last_edited_at: null,
+    tasks: [], tables: [], charts: [], links: [], files: [], children: [],
+    notes, color: null,
+    startDate: null, endDate: null,   // the project's OWN span — separate from any individual task's start/deadline
+  }
+}
+// Canonical task item — same field names (title/deadline/status) no matter
+// which flow adds the task, so every task renders correctly in Kanban/Gantt/
+// the Upcoming view regardless of origin.
+function makeTask({ id, title="New task", status="Not started", deadline=null, ...rest } = {}){
+  return taskDefaults({ id: id || "t_"+Date.now()+"_"+Math.random().toString(36).slice(2,7), title, status, deadline, ...rest })
+}
+// Migration — projects saved before the subprojects→tasks rename (or from
+// before tables/charts/children existed at all) get patched to the current
+// canonical shape on load, recursively through the whole tree. Without this,
+// loading old localStorage data would crash the moment anything reads
+// `.tasks` on a project that only has the old `.subprojects` field.
+function normalizeNode(n){
+  if(!n) return n
+  const tasks = n.tasks || n.subprojects || []
+  const { subprojects, ...rest } = n
+  return {
+    ...rest,
+    type: rest.type || "project",
+    tasks, tables: rest.tables||[], charts: rest.charts||[], links: rest.links||[],
+    files: rest.files||[], notes: rest.notes||"",
+    startDate: rest.startDate ?? null, endDate: rest.endDate ?? null,
+    children: (rest.children||[]).map(normalizeNode),
+  }
+}
 
 // Auto-calculated spend vs budget — the one thing that's genuinely derived
 // rather than user-entered.
@@ -282,30 +327,30 @@ const CAT_ICONS = {
 }
 
 // ─── Seed data (from live Notion query) ───────────────────────────────────────
+// Demo/starter data — built through the same makeNode() constructor every
+// real project goes through, so the seed data has exactly the same shape
+// (children/tables/charts/links all present) as anything a user creates.
 const SEED = [
-  { id:"valle", title:"Valle Grail", emoji:"🔱", status:"In progress", category:"brand",
+  { ...makeNode({ id:"valle", title:"Valle Grail", emoji:"🔱", status:"In progress", category:"brand",
+      description:"UK streetwear brand. Tapstitch manufacturer. 308 IG saves on key post." }),
     notion_url:"https://app.notion.com/2eb8b2fbd65e803cbf37e93e99b6aaa9",
-    description:"UK streetwear brand. Tapstitch manufacturer. 308 IG saves on key post.",
-    subprojects:[
-      {id:"v1",title:"Genesis",status:"Complete",deadline:null},
-      {id:"v2",title:"Exodus",status:"In progress",deadline:"2026-09-01"},
-    ], files:[] },
-  { id:"mello", title:"Mello", emoji:"🚁", status:"In progress", category:"engineering",
+    tasks:[
+      makeTask({id:"v1",title:"Genesis",status:"Complete"}),
+      makeTask({id:"v2",title:"Exodus",status:"In progress",deadline:"2026-09-01"}),
+    ] },
+  { ...makeNode({ id:"mello", title:"Mello", emoji:"🚁", status:"In progress", category:"engineering",
+      description:"Extracurricular drone project." }),
     notion_url:"https://app.notion.com/24c8b2fbd65e80768b09e5bc9f81b534",
-    description:"Extracurricular drone project.",
-    subprojects:[
-      {id:"m1",title:"Frame design",status:"In progress",deadline:null},
-      {id:"m2",title:"Flight controller",status:"Not started",deadline:null},
-      {id:"m3",title:"STL / CAD files",status:"Not started",deadline:null},
-    ], files:[] },
-  { id:"rift", title:"The Rift", emoji:"✍️", status:"Not started", category:"creative",
-    notion_url:"https://app.notion.com/2028b2fbd65e810b942bf77c79701bba",
-    description:"Creative writing / worldbuilding project.",
-    subprojects:[], files:[] },
-  { id:"tjoke", title:"The Terrific Joke", emoji:"🎭", status:"Not started", category:"creative",
-    notion_url:"https://app.notion.com/2758b2fbd65e803e8a04ff2da4a3c032",
-    description:"",
-    subprojects:[], files:[] },
+    tasks:[
+      makeTask({id:"m1",title:"Frame design",status:"In progress"}),
+      makeTask({id:"m2",title:"Flight controller",status:"Not started"}),
+      makeTask({id:"m3",title:"STL / CAD files",status:"Not started"}),
+    ] },
+  { ...makeNode({ id:"rift", title:"The Rift", emoji:"✍️", status:"Not started", category:"creative",
+      description:"Creative writing / worldbuilding project." }),
+    notion_url:"https://app.notion.com/2028b2fbd65e810b942bf77c79701bba" },
+  { ...makeNode({ id:"tjoke", title:"The Terrific Joke", emoji:"🎭", status:"Not started", category:"creative" }),
+    notion_url:"https://app.notion.com/2758b2fbd65e803e8a04ff2da4a3c032" },
 ]
 
 // ─── Module-level date utilities (used by both CalendarView and DigestView) ───
@@ -741,6 +786,41 @@ export default function LifeOS(){
   const [files,setFiles] = useState([])
   const [sel,setSel]   = useState(null)
   const [categories,setCategories] = useState(DEFAULT_CATS) // extensible
+  // ── Category (project "type") management — parity with what event types
+  // already have for creation, but adds what was missing everywhere: rename,
+  // recolor, re-icon, edit default sections, and delete. Delete reassigns any
+  // projects currently using the category to "other" rather than leaving
+  // them with a dangling reference.
+  function updateCategory(key, changes){
+    const nc = {...categories, [key]: {...categories[key], ...changes}}
+    setCategories(nc); save({categories:nc})
+  }
+  function renameCategory(oldKey, newKeyRaw){
+    if(oldKey==="other"){ flash('"other" can\'t be renamed — it\'s the fallback for removed types.',"warn"); return }
+    const newKey = newKeyRaw.trim().toLowerCase().replace(/\s+/g,"-")
+    if(!newKey || newKey===oldKey) return
+    if(categories[newKey]){ flash(`"${newKey}" already exists.`,"warn"); return }
+    const nc = {...categories}
+    nc[newKey] = nc[oldKey]
+    delete nc[oldKey]
+    setCategories(nc); save({categories:nc})
+    // Repoint every project currently using the old key
+    const np = projects.map(p => p.category===oldKey ? {...p, category:newKey} : p)
+    setProjects(np); save({projects:np})
+  }
+  function deleteCategory(key){
+    if(key==="other"){ flash('"other" can\'t be deleted — it\'s the fallback for removed types.',"warn"); return }
+    const inUse = projects.filter(p=>p.category===key).length
+    if(!confirm(inUse
+      ? `"${key}" is used by ${inUse} project${inUse!==1?"s":""}. Delete it anyway? They'll move to "other".`
+      : `Delete the "${key}" type?`)) return
+    const nc = {...categories}; delete nc[key]
+    setCategories(nc); save({categories:nc})
+    if(inUse){
+      const np = projects.map(p => p.category===key ? {...p, category:"other"} : p)
+      setProjects(np); save({projects:np})
+    }
+  }
   const [editingTitle,setEditingTitle] = useState(null)
   // Pull from Notion the moment a project/page is opened — if it's already
   // synced, this checks for remote changes and applies them before the user
@@ -850,7 +930,7 @@ export default function LifeOS(){
   useEffect(()=>{
     try{
       const d=JSON.parse(localStorage.getItem(LS_KEY)||"{}")
-      if(d.projects?.length) setProjects(d.projects)
+      if(d.projects?.length) setProjects(d.projects.map(normalizeNode))
       if(d.files) setFiles(d.files)
       if(d.device) setDevice(d.device)
       if(d.categories) setCategories({...DEFAULT_CATS,...d.categories})
@@ -904,13 +984,13 @@ export default function LifeOS(){
     if(sel?.id===nodeId) setSel(fn(sel))
     save({projects:np})
   }
-  function updateTask(projId, taskId, changes){ updateNode(projId, p=>({...p,subprojects:(p.subprojects||[]).map(x=>x.id===taskId?{...x,...changes}:x)})) }
+  function updateTask(projId, taskId, changes){ updateNode(projId, p=>({...p,tasks:(p.tasks||[]).map(x=>x.id===taskId?{...x,...changes}:x)})) }
   function addTask(projId, task){
-    const t = taskDefaults({id:"t_"+Date.now(),title:"New task",status:"Not started",deadline:null,...task})
-    updateNode(projId, p=>({...p,subprojects:[...(p.subprojects||[]),t]}))
+    const t = makeTask(task)
+    updateNode(projId, p=>({...p,tasks:[...(p.tasks||[]),t]}))
     return t
   }
-  function deleteTask(projId, taskId){ updateNode(projId, p=>({...p,subprojects:(p.subprojects||[]).filter(x=>x.id!==taskId)})) }
+  function deleteTask(projId, taskId){ updateNode(projId, p=>({...p,tasks:(p.tasks||[]).filter(x=>x.id!==taskId)})) }
   function setBudget(projId, budget){ updateNode(projId, p=>({...p,budget})) }
   function addExpense(projId, expense){ updateNode(projId, p=>({...p,expenses:[...(p.expenses||[]),expense]})) }
   function updateExpense(projId, expId, changes){ updateNode(projId, p=>({...p,expenses:(p.expenses||[]).map(x=>x.id===expId?{...x,...changes}:x)})) }
@@ -949,9 +1029,8 @@ export default function LifeOS(){
   // ── Children — projects within projects, pages within pages, any depth ───
   function addChild(parentId, type){
     const child = type==="page"
-      ? {id:"n_"+Date.now(), type:"page", title:"New page", sections:["notes"], children:[], status:"Not started", category:null, subprojects:[], files:[]}
-      : {id:"n_"+Date.now(), type:"project", title:"New project", sections:["tasks"], children:[], status:"Not started",
-         category:(findInTree(projects,parentId)?.category)||"other", subprojects:[], files:[]}
+      ? makeNode({ type:"page", title:"New page" })
+      : makeNode({ type:"project", title:"New project", category:(findInTree(projects,parentId)?.category)||"other" })
     updateNode(parentId, p=>({...p,children:[...(p.children||[]),child]}))
     setSel(child)
     return child
@@ -1151,7 +1230,7 @@ export default function LifeOS(){
       }
 
       // Diff — only update fields that actually changed, don't touch
-      // fields Notion doesn't know about (local-only: subprojects, charts, etc.)
+      // fields Notion doesn't know about (local-only: tasks, charts, etc.)
       const notionEditedAt = page.last_edited_time
       const localEditedAt = node.notion_last_edited_at
 
@@ -1228,10 +1307,9 @@ export default function LifeOS(){
       const sections = structured?.sections?.length ? [...new Set(structured.sections)] : ["notes"]
 
       const node = {
-        id:"n_imp"+Date.now(), type:"page", title,
+        ...makeNode({ type:"page", title, sections, notes: structured?.notes ?? rawText }),
         notion_page_id:pageId, notion_url:page.url||null, notion_last_edited_at:page.last_edited_time,
-        sections, notes:structured?.notes ?? rawText, tables, links, charts,
-        children:[], subprojects:[], files:[], status:"Not started", category:null,
+        tables, links, charts,
       }
       const np=[node,...projects]
       setProjects(np); save({projects:np}); setSel(node); setTab("projects")
@@ -1308,9 +1386,10 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
       let np=[...projects], nf=[...files]
 
       if(action.type==="create_project"){
-        const p={id:"p_"+Date.now(),title:action.params.title||"Untitled",emoji:action.params.emoji||"📁",
-          status:"Not started",category:action.params.category||"other",notion_url:null,
-          description:action.params.description||"",subprojects:[],files:[]}
+        const p=makeNode({
+          title: action.params.title||"Untitled", emoji: action.params.emoji||"📁",
+          category: action.params.category||"other", description: action.params.description||"",
+        })
         np=[...projects,p]
         setProjects(np)
         setTab("projects")
@@ -1328,7 +1407,7 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
         const matched=projects.find(p=>p.id===pid||p.title.toLowerCase().includes((pid||"").toLowerCase()))
         if(matched){
           np=projects.map(p=>p.id===matched.id
-            ?{...p,subprojects:[...p.subprojects,{id:"t_"+Date.now(),title:action.params.title,
+            ?{...p,tasks:[...p.tasks,{id:"t_"+Date.now(),title:action.params.title,
               status:action.params.status||"Not started",deadline:action.params.deadline||null}]}
             :p)
           setProjects(np)
@@ -1360,7 +1439,7 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
         const ch=action.params.changes||{}
         np=projects.map(p=>{
           if(!(p.id===pid||p.title.toLowerCase().includes((pid||"").toLowerCase()))) return p
-          return{...p,subprojects:p.subprojects.map(t=>{
+          return{...p,tasks:(p.tasks||[]).map(t=>{
             if(t.id===tid||t.title.toLowerCase().includes((tid||"").toLowerCase()))
               return{...t,...(ch.title&&{title:ch.title}),...(ch.status&&{status:ch.status}),...(ch.deadline!==undefined&&{deadline:ch.deadline})}
             return t
@@ -1373,7 +1452,7 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
         const tid=action.params.taskId
         np=projects.map(p=>{
           if(!(p.id===pid||p.title.toLowerCase().includes((pid||"").toLowerCase()))) return p
-          return{...p,subprojects:p.subprojects.filter(t=>t.id!==tid&&!t.title.toLowerCase().includes((tid||"").toLowerCase()))}
+          return{...p,tasks:(p.tasks||[]).filter(t=>t.id!==tid&&!t.title.toLowerCase().includes((tid||"").toLowerCase()))}
         })
         setProjects(np)
         if(sel){const updated=np.find(p=>p.id===sel.id);if(updated)setSel(updated)}
@@ -1395,17 +1474,17 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
 
   function Dashboard(){
     const active = projects.filter(p=>p.status==="In progress")
-    const upcoming = projects.flatMap(p=>p.subprojects.filter(s=>s.deadline))
+    const upcoming = projects.flatMap(p=>(p.tasks||[]).filter(s=>s.deadline))
       .sort((a,b)=>a.deadline>b.deadline?1:-1).slice(0,6)
-    const totalTasks = projects.flatMap(p=>p.subprojects).length
-    const doneTasks  = projects.flatMap(p=>p.subprojects).filter(s=>s.status==="Complete").length
+    const totalTasks = projects.flatMap(p=>p.tasks||[]).length
+    const doneTasks  = projects.flatMap(p=>p.tasks||[]).filter(s=>s.status==="Complete").length
     const [canvas,setCanvas] = useState(null)
     const hasCanvas = creds.some(c=>c.service==="canvas")
     useEffect(()=>{ if(hasCanvas) fetchCanvasSummary().then(setCanvas) },[hasCanvas])
 
     // Progress bar — driven by sub-tasks
     function Progress({p}){
-      const total=p.subprojects.length, done=p.subprojects.filter(s=>s.status==="Complete").length
+      const total=(p.tasks||[]).length, done=(p.tasks||[]).filter(s=>s.status==="Complete").length
       if(!total) return <span style={{fontSize:"9px",fontFamily:"var(--mono)",color:"var(--m)"}}>—</span>
       const pct=Math.round(done/total*100)
       const cc=CAT_COLOR[p.category]||"#666"
@@ -1445,14 +1524,13 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
             <div style={{display:"flex",gap:"20px",overflow:"hidden",WebkitMaskImage:"linear-gradient(to right,transparent,black 4%,black 93%,transparent)"}}>
               {active.map(p=>{
                 const cc=CAT_COLOR[p.category]||"#666"
-                const next=p.subprojects.find(s=>s.status==="In progress")||p.subprojects.find(s=>s.status==="Not started")
+                const next=(p.tasks||[]).find(s=>s.status==="In progress")||(p.tasks||[]).find(s=>s.status==="Not started")
                 return(
                   <span key={p.id} onClick={()=>{setTab("projects");setSel(p)}}
                     style={{fontSize:"10px",fontFamily:"var(--mono)",color:"var(--d)",cursor:"pointer",
                       whiteSpace:"nowrap",display:"flex",alignItems:"center",gap:"6px",transition:"color .1s"}}
                     onMouseEnter={e=>e.currentTarget.style.color=cc}
                     onMouseLeave={e=>e.currentTarget.style.color="var(--d)"}>
-                    <LucideIcon name={catIconName(p.category,categories)} size={10} color={cc}/>
                     {p.title}
                     {next&&<span style={{color:"var(--m)"}}>· {next.title.length>22?next.title.slice(0,20)+"…":next.title}</span>}
                   </span>
@@ -1490,8 +1568,8 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
                 const cc=CAT_COLOR[p.category]||"#666"
                 const catConf=categories[p.category]||{emoji:"📁"}
                 const dim=p.status==="Not started"
-                const tasksDone=p.subprojects.filter(s=>s.status==="Complete").length
-                const tasksTotal=p.subprojects.length
+                const tasksDone=(p.tasks||[]).filter(s=>s.status==="Complete").length
+                const tasksTotal=(p.tasks||[]).length
                 return(
                   <div key={p.id} onClick={()=>{setTab("projects");setSel(p)}}
                     style={{background:"var(--s1)",border:"1px solid var(--b)",borderRadius:"8px",
@@ -1503,8 +1581,7 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
                     <div style={{position:"absolute",top:0,left:0,width:"3px",height:"100%",background:cc,borderRadius:"8px 0 0 8px"}}/>
                     {/* Card content */}
                     <div style={{paddingLeft:"8px"}}>
-                      <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:"8px"}}>
-                        <LucideIcon name={catIconName(p.category,categories)} size={18} color={cc}/>
+                      <div style={{display:"flex",alignItems:"flex-start",justifyContent:"flex-end",marginBottom:"8px"}}>
                         <span style={{fontSize:"9px",fontFamily:"var(--mono)",color:cc,letterSpacing:".04em",
                           background:cc+"15",padding:"2px 5px",borderRadius:"3px"}}>{p.category}</span>
                       </div>
@@ -1733,6 +1810,20 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
   }
 
   function Projects(){
+    const [previewFor,setPreviewFor] = useState(null)    // link id currently showing a preview card
+    const [previewData,setPreviewData] = useState({})     // linkId -> {title,description,image,favicon,domain} | "loading" | "error"
+    async function togglePreview(lk){
+      if(previewFor===lk.id){ setPreviewFor(null); return }
+      setPreviewFor(lk.id)
+      if(previewData[lk.id] && previewData[lk.id]!=="error") return  // already have it
+      setPreviewData(d=>({...d,[lk.id]:"loading"}))
+      try{
+        const data = await fetchLinkPreview(lk.url)
+        setPreviewData(d=>({...d,[lk.id]:data}))
+      }catch{
+        setPreviewData(d=>({...d,[lk.id]:"error"}))
+      }
+    }
     return(
       <div style={{display:"grid",gridTemplateColumns:sel?"240px 1fr":"240px 1fr",height:"100%",overflow:"hidden"}}>
         {/* List */}
@@ -1752,7 +1843,6 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
                   borderLeft:active?"2px solid var(--amber)":"2px solid transparent",
                   transition:"all .1s"}}
                 className={active?"":"hr"}>
-                <LucideIcon name={catIconName(p.category,categories)} size={14} color={CAT_COLOR[p.category]||"#666"}/>
                 <div style={{flex:1,minWidth:0}}>
                   <div style={{fontSize:"12px",fontWeight:"500",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.title}</div>
                   <div style={{fontSize:"10px",fontFamily:"var(--mono)",color:cc,marginTop:"1px"}}>{p.category}</div>
@@ -1772,7 +1862,7 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
         {sel?(()=>{
           const liveSel = findInTree(projects, sel.id) || sel
           const path = findPathInTree(projects, sel.id) || [liveSel]
-          const visibleTasks = (liveSel.subprojects||[]).map(taskDefaults).filter(t=>taskKindFilter==="all"||t.kind===taskKindFilter)
+          const visibleTasks = (liveSel.tasks||[]).map(taskDefaults).filter(t=>taskKindFilter==="all"||t.kind===taskKindFilter)
           const bStats = budgetStats(liveSel)
           const selNode = liveSel
           return (
@@ -1799,7 +1889,6 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:"22px"}}>
               <div>
                 <div style={{display:"flex",alignItems:"center",gap:"10px",marginBottom:"4px"}}>
-                <LucideIcon name={catIconName(sel.category,categories)} size={20} color={CAT_COLOR[sel.category]||"#666"}/>
                 <span style={{fontSize:"18px",fontWeight:"500"}}>{sel.title}</span>
               </div>
                 {sel.description&&<div style={{fontSize:"12px",color:"var(--d)",maxWidth:"440px",lineHeight:"1.5"}}>{sel.description}</div>}
@@ -1909,6 +1998,59 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
                 </div>
               </div>
             )}
+
+            {sectionsOf(sel).includes("timeline")&&<>
+            {/* Timeline — the project's OWN start/end span, distinct from
+                individual task dates (which have their own Gantt view under
+                Tasks). This is "when does the whole thing run," e.g. a
+                collection that spans March–June regardless of which specific
+                tasks inside it are scheduled when. */}
+            <div style={{marginBottom:"24px"}}>
+              <Eyebrow style={{marginBottom:"10px"}}>TIMELINE</Eyebrow>
+              <div style={{background:"var(--s1)",border:"1px solid var(--b)",borderRadius:"8px",padding:"13px 14px"}}>
+                <div style={{display:"flex",gap:"10px",marginBottom:"12px"}}>
+                  <div style={{flex:1}}>
+                    <Eyebrow style={{marginBottom:"4px"}}>START</Eyebrow>
+                    <input type="date" defaultValue={sel.startDate||""}
+                      onBlur={e=>updateNode(sel.id,p=>({...p,startDate:e.target.value||null}))}
+                      style={{width:"100%",background:"var(--s3)",color:"var(--t)",border:"1px solid var(--b)",borderRadius:"5px",padding:"6px 8px",fontSize:"11px",colorScheme:"dark"}}/>
+                  </div>
+                  <div style={{flex:1}}>
+                    <Eyebrow style={{marginBottom:"4px"}}>END</Eyebrow>
+                    <input type="date" defaultValue={sel.endDate||""}
+                      onBlur={e=>updateNode(sel.id,p=>({...p,endDate:e.target.value||null}))}
+                      style={{width:"100%",background:"var(--s3)",color:"var(--t)",border:"1px solid var(--b)",borderRadius:"5px",padding:"6px 8px",fontSize:"11px",colorScheme:"dark"}}/>
+                  </div>
+                </div>
+                {sel.startDate&&sel.endDate?(()=>{
+                  const start=new Date(sel.startDate+"T00:00:00"), end=new Date(sel.endDate+"T00:00:00"), today=new Date(); today.setHours(0,0,0,0)
+                  const totalDays=Math.max(1,Math.round((end-start)/86400000))
+                  const elapsedDays=Math.round((today-start)/86400000)
+                  const pct=Math.max(0,Math.min(100,(elapsedDays/totalDays)*100))
+                  const overdue=today>end
+                  const daysLeft=Math.round((end-today)/86400000)
+                  return(
+                    <div>
+                      <div style={{height:"8px",background:"var(--s3)",borderRadius:"4px",overflow:"hidden",position:"relative"}}>
+                        <div style={{height:"100%",width:pct+"%",background:overdue?"#e05555":"var(--amber)",borderRadius:"4px",transition:"width .3s"}}/>
+                      </div>
+                      <div style={{display:"flex",justifyContent:"space-between",marginTop:"6px"}}>
+                        <span style={{fontSize:"9px",fontFamily:"var(--mono)",color:"var(--m)"}}>{start.toLocaleDateString("en-GB",{day:"numeric",month:"short"})}</span>
+                        <span style={{fontSize:"10px",fontFamily:"var(--mono)",fontWeight:"600",color:overdue?"#e05555":"var(--amber)"}}>
+                          {overdue?`${Math.abs(daysLeft)}d overdue`:today<start?`starts in ${Math.round((start-today)/86400000)}d`:`${daysLeft}d left`}
+                        </span>
+                        <span style={{fontSize:"9px",fontFamily:"var(--mono)",color:"var(--m)"}}>{end.toLocaleDateString("en-GB",{day:"numeric",month:"short"})}</span>
+                      </div>
+                    </div>
+                  )
+                })():(
+                  <div style={{fontSize:"10px",color:"var(--m)",fontStyle:"italic"}}>
+                    {sel.startDate||sel.endDate?"Set both dates to see the timeline bar.":"Set a start and end date to track this project's overall span."}
+                  </div>
+                )}
+              </div>
+            </div>
+            </>}
 
             {sectionsOf(sel).includes("tasks")&&<>
             {/* Tasks */}
@@ -2160,17 +2302,57 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
             <div style={{marginBottom:"24px"}}>
               <Eyebrow style={{marginBottom:"10px"}}>LINKS</Eyebrow>
               <div style={{background:"var(--s1)",border:"1px solid var(--b)",borderRadius:"8px",overflow:"hidden"}}>
-                {(sel.links||[]).map((lk,i,arr)=>(
-                  <div key={lk.id} style={{display:"flex",alignItems:"center",gap:"8px",padding:"7px 13px",borderBottom:i<arr.length-1?"1px solid var(--b)":"none"}} className="hr">
-                    <Link2 size={12} color="var(--d)" strokeWidth={1.5}/>
-                    <input defaultValue={lk.label} placeholder="label" onBlur={e=>updateLink(sel.id,lk.id,{label:e.target.value})}
-                      style={{background:"transparent",border:"none",color:"var(--t)",fontSize:"12px",outline:"none",width:"160px",flexShrink:0}}/>
-                    <input defaultValue={lk.url} placeholder="https://…" onBlur={e=>updateLink(sel.id,lk.id,{url:e.target.value})}
-                      style={{background:"transparent",border:"none",color:"var(--d)",fontFamily:"var(--mono)",fontSize:"11px",outline:"none",flex:1}}/>
-                    {lk.url&&<a href={lk.url} target="_blank" rel="noreferrer" style={{color:"var(--teal)",display:"flex"}}><ExternalLink size={11}/></a>}
-                    <button onClick={()=>deleteLink(sel.id,lk.id)} style={{background:"none",border:"none",cursor:"pointer",color:"var(--m)",padding:0}}><X size={11}/></button>
+                {(sel.links||[]).map((lk,i,arr)=>{
+                  const isPreviewOpen = previewFor===lk.id
+                  const pv = previewData[lk.id]
+                  let domain=null
+                  try{ domain = lk.url ? new URL(lk.url.match(/^https?:\/\//)?lk.url:"https://"+lk.url).hostname : null }catch{}
+                  return(
+                  <div key={lk.id} style={{borderBottom:i<arr.length-1?"1px solid var(--b)":"none"}}>
+                    <div style={{display:"flex",alignItems:"center",gap:"8px",padding:"7px 13px"}} className="hr">
+                      {domain
+                        ? <img src={`https://www.google.com/s2/favicons?domain=${domain}&sz=32`} width={12} height={12} style={{borderRadius:"2px",flexShrink:0}} alt=""/>
+                        : <Link2 size={12} color="var(--d)" strokeWidth={1.5}/>}
+                      <input defaultValue={lk.label} placeholder="label" onBlur={e=>updateLink(sel.id,lk.id,{label:e.target.value})}
+                        style={{background:"transparent",border:"none",color:"var(--t)",fontSize:"12px",outline:"none",width:"160px",flexShrink:0}}/>
+                      <input defaultValue={lk.url} placeholder="https://…" onBlur={e=>updateLink(sel.id,lk.id,{url:e.target.value})}
+                        style={{background:"transparent",border:"none",color:"var(--d)",fontFamily:"var(--mono)",fontSize:"11px",outline:"none",flex:1}}/>
+                      {lk.url&&(
+                        <button onClick={()=>togglePreview(lk)} title="Quick preview"
+                          style={{background:"none",border:"none",cursor:"pointer",color:isPreviewOpen?"var(--amber)":"var(--m)",display:"flex",padding:0}}>
+                          <Eye size={12}/>
+                        </button>
+                      )}
+                      {lk.url&&<a href={lk.url} target="_blank" rel="noreferrer" style={{color:"var(--teal)",display:"flex"}}><ExternalLink size={11}/></a>}
+                      <button onClick={()=>deleteLink(sel.id,lk.id)} style={{background:"none",border:"none",cursor:"pointer",color:"var(--m)",padding:0}}><X size={11}/></button>
+                    </div>
+                    {isPreviewOpen&&(
+                      <div style={{padding:"0 13px 12px"}} className="fi">
+                        {pv==="loading"&&(
+                          <div style={{fontSize:"10px",color:"var(--m)",fontStyle:"italic",padding:"8px 0"}}>Loading preview…</div>
+                        )}
+                        {pv==="error"&&(
+                          <div style={{fontSize:"10px",color:"var(--m)",fontStyle:"italic",padding:"8px 0"}}>Couldn't load a preview for this link.</div>
+                        )}
+                        {pv&&pv!=="loading"&&pv!=="error"&&(
+                          <a href={lk.url} target="_blank" rel="noreferrer" style={{display:"flex",gap:"10px",textDecoration:"none",
+                            background:"var(--s2)",border:"1px solid var(--b)",borderRadius:"7px",padding:"9px",alignItems:"center"}}>
+                            {pv.image
+                              ? <img src={pv.image} alt="" style={{width:"64px",height:"64px",objectFit:"cover",borderRadius:"5px",flexShrink:0,background:"var(--s3)"}}
+                                  onError={e=>{e.target.style.display="none"}}/>
+                              : <img src={pv.favicon} alt="" width={28} height={28} style={{flexShrink:0}}/>
+                            }
+                            <div style={{minWidth:0,flex:1}}>
+                              <div style={{fontSize:"12px",color:"var(--t)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{pv.title}</div>
+                              {pv.description&&<div style={{fontSize:"10px",color:"var(--d)",marginTop:"2px",overflow:"hidden",textOverflow:"ellipsis",display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical"}}>{pv.description}</div>}
+                              <div style={{fontSize:"9px",fontFamily:"var(--mono)",color:"var(--m)",marginTop:"3px"}}>{pv.domain}</div>
+                            </div>
+                          </a>
+                        )}
+                      </div>
+                    )}
                   </div>
-                ))}
+                )})}
                 <div style={{padding:"9px 13px"}}>
                   {(sel.links||[]).length===0&&(
                     <div style={{display:"flex",flexWrap:"wrap",gap:"5px",marginBottom:"8px"}}>
@@ -2676,6 +2858,11 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
     const [editEvent,setEditEvent]=useState(null)   // event object currently open for streamlined editing
     const [editSaving,setEditSaving]=useState(false)
     const [editSavedFlash,setEditSavedFlash]=useState(false)
+    const [viewMode,setViewMode]=useState("week")   // "week" | "day" — day view supports click-drag time selection
+    const [dayOff,setDayOff]=useState(0)             // days from today, for day view navigation
+    const [dragSel,setDragSel]=useState(null)        // {startMin,endMin} while dragging, null otherwise
+    const dragStartRef=useRef(null)
+    const gridRef=useRef(null)
 
     async function saveEditField(changes){
       if(!editEvent?.id) return
@@ -2699,6 +2886,43 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
         const start=ymd(weekStart),end=ymd(addD(weekStart,8))
         notionCalQuery(start,end).then(setNotionEvents).catch(()=>{})
       }catch(e){ flash("Couldn't delete: "+e.message,"warn") }
+    }
+
+    // ── Day-view drag-select — click and drag across the hourly grid to pick
+    // a time range, snapped to 15-min increments. Mouse-up opens the normal
+    // add-event form pre-filled with the dragged date/start/end — reuses the
+    // exact same creation flow as the "+ event" button, just pre-populated.
+    const DAY_START_HOUR=7, DAY_END_HOUR=23, HOUR_PX=52
+    function minutesFromY(y){
+      const clamped=Math.max(0,Math.min(y,(DAY_END_HOUR-DAY_START_HOUR)*HOUR_PX))
+      const rawMin=DAY_START_HOUR*60 + (clamped/HOUR_PX)*60
+      return Math.round(rawMin/15)*15   // snap to 15 min
+    }
+    function onGridMouseDown(e){
+      if(!gridRef.current) return
+      const rect=gridRef.current.getBoundingClientRect()
+      const y=e.clientY-rect.top
+      const startMin=minutesFromY(y)
+      dragStartRef.current=startMin
+      setDragSel({startMin,endMin:startMin+30})
+    }
+    function onGridMouseMove(e){
+      if(dragStartRef.current==null||!gridRef.current) return
+      const rect=gridRef.current.getBoundingClientRect()
+      const y=e.clientY-rect.top
+      const curMin=minutesFromY(y)
+      const start=dragStartRef.current
+      setDragSel(curMin>=start?{startMin:start,endMin:Math.max(curMin,start+15)}:{startMin:curMin,endMin:start})
+    }
+    function onGridMouseUp(){
+      if(dragStartRef.current==null) return
+      dragStartRef.current=null
+      if(!dragSel) return
+      const dayDate=addD(new Date(),dayOff)
+      const toHM=m=>`${String(Math.floor(m/60)).padStart(2,"0")}:${String(m%60).padStart(2,"0")}`
+      setAddForm(f=>({...f,date:ymd(dayDate),time:toHM(dragSel.startMin),endTime:toHM(dragSel.endMin)}))
+      setAddOpen(true)
+      setDragSel(null)
     }
 
 
@@ -2725,14 +2949,19 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
       } catch{ return [] }
     })()
 
-    // Fetch Notion events for this week
+    // Fetch Notion events — range covers whichever view is active (or both,
+    // since switching modes shouldn't require a re-fetch to catch up)
     useEffect(()=>{
       if(!apiBase || !creds.some(c=>c.service==="notion")){setNotionEvents([]);return}
       setLoading(true);setErr("")
-      const start=ymd(weekStart),end=ymd(addD(weekStart,8))
+      const dayDate=addD(new Date(),dayOff)
+      const weekEnd=addD(weekStart,8)
+      const rangeStart = weekStart<dayDate ? weekStart : dayDate
+      const rangeEnd = weekEnd>dayDate ? weekEnd : addD(dayDate,1)
+      const start=ymd(rangeStart),end=ymd(rangeEnd)
       notionCalQuery(start,end).then(setNotionEvents).catch(e=>setErr(e.message)).finally(()=>setLoading(false))
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    },[wOff,apiBase,creds])
+    },[wOff,dayOff,apiBase,creds])
 
     const allEvents=[...timetableSessions,...notionEvents]
     const fmt=d=>d.toLocaleDateString("en-GB",{day:"numeric",month:"short"})
@@ -2757,13 +2986,31 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
       <div style={{padding:"16px 20px",height:"100%",display:"flex",flexDirection:"column",gap:"12px",overflowY:"auto"}}>
         {/* Header row */}
         <div style={{display:"flex",alignItems:"center",gap:"10px"}}>
-          <button onClick={()=>setWOff(w=>w-1)} style={{background:"var(--s2)",border:"1px solid var(--b)",color:"var(--d)",borderRadius:"5px",padding:"5px 10px",cursor:"pointer",fontSize:"12px"}}>←</button>
+          <button onClick={()=>viewMode==="day"?setDayOff(d=>d-1):setWOff(w=>w-1)} style={{background:"var(--s2)",border:"1px solid var(--b)",color:"var(--d)",borderRadius:"5px",padding:"5px 10px",cursor:"pointer",fontSize:"12px"}}>←</button>
           <div style={{flex:1,textAlign:"center"}}>
-            <div style={{fontSize:"12px",fontWeight:"500"}}>{fmt(weekStart)} — {fmt(days[6])}</div>
-            <Eyebrow style={{marginTop:"2px"}}>{wOff===0?"THIS WEEK":wOff<0?Math.abs(wOff)+" WEEK(S) AGO":wOff+" WEEK(S) AHEAD"}</Eyebrow>
+            {viewMode==="day"?(
+              <>
+                <div style={{fontSize:"12px",fontWeight:"500"}}>{addD(new Date(),dayOff).toLocaleDateString("en-GB",{weekday:"long",day:"numeric",month:"short"})}</div>
+                <Eyebrow style={{marginTop:"2px"}}>{dayOff===0?"TODAY":dayOff<0?Math.abs(dayOff)+" DAY(S) AGO":dayOff+" DAY(S) AHEAD"}</Eyebrow>
+              </>
+            ):(
+              <>
+                <div style={{fontSize:"12px",fontWeight:"500"}}>{fmt(weekStart)} — {fmt(days[6])}</div>
+                <Eyebrow style={{marginTop:"2px"}}>{wOff===0?"THIS WEEK":wOff<0?Math.abs(wOff)+" WEEK(S) AGO":wOff+" WEEK(S) AHEAD"}</Eyebrow>
+              </>
+            )}
           </div>
-          <button onClick={()=>setWOff(0)} style={{background:"transparent",border:"1px solid var(--b)",color:"var(--d)",borderRadius:"5px",padding:"5px 9px",cursor:"pointer",fontSize:"10px",fontFamily:"var(--mono)"}}>now</button>
-          <button onClick={()=>setWOff(w=>w+1)} style={{background:"var(--s2)",border:"1px solid var(--b)",color:"var(--d)",borderRadius:"5px",padding:"5px 10px",cursor:"pointer",fontSize:"12px"}}>→</button>
+          <button onClick={()=>viewMode==="day"?setDayOff(0):setWOff(0)} style={{background:"transparent",border:"1px solid var(--b)",color:"var(--d)",borderRadius:"5px",padding:"5px 9px",cursor:"pointer",fontSize:"10px",fontFamily:"var(--mono)"}}>now</button>
+          <button onClick={()=>viewMode==="day"?setDayOff(d=>d+1):setWOff(w=>w+1)} style={{background:"var(--s2)",border:"1px solid var(--b)",color:"var(--d)",borderRadius:"5px",padding:"5px 10px",cursor:"pointer",fontSize:"12px"}}>→</button>
+          <div style={{display:"flex",border:"1px solid var(--b)",borderRadius:"5px",overflow:"hidden"}}>
+            {["week","day"].map(v=>(
+              <button key={v} onClick={()=>setViewMode(v)}
+                style={{fontSize:"10px",fontFamily:"var(--mono)",padding:"5px 10px",border:"none",cursor:"pointer",
+                  background:viewMode===v?"var(--amber)":"transparent",color:viewMode===v?"#000":"var(--d)"}}>
+                {v}
+              </button>
+            ))}
+          </div>
           <button onClick={()=>setAddOpen(true)} style={{background:"var(--amber)",color:"#000",border:"none",borderRadius:"5px",padding:"6px 12px",cursor:"pointer",fontSize:"11px",fontWeight:"600",fontFamily:"var(--mono)"}}>+ event</button>
           <a href={NOTION_CAL_URL} target="_blank" rel="noreferrer" style={{fontSize:"10px",fontFamily:"var(--mono)",color:"var(--d)",textDecoration:"none",border:"1px solid var(--b)",borderRadius:"4px",padding:"5px 9px"}}>notion ↗</a>
         </div>
@@ -2777,6 +3024,8 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
 
         <DayUtilization events={allEvents.filter(e=>e.date===todayStr)} eventTypes={eventTypes}/>
 
+        {viewMode==="week"?(
+        <>
         {/* Week grid */}
         <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:"5px",flex:1}}>
           {days.map(day=>{
@@ -2811,6 +3060,62 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
             )
           })}
         </div>
+        </>
+        ):(
+        <>
+        {/* Day view — hourly grid, click-and-drag to select a time range */}
+        <div style={{fontSize:"9px",fontFamily:"var(--mono)",color:"var(--m)",marginBottom:"2px"}}>
+          Click and drag on the grid below to create an event in that time slot.
+        </div>
+        <div style={{display:"flex",flex:1,overflowY:"auto",border:"1px solid var(--b)",borderRadius:"6px"}}>
+          {/* Hour labels */}
+          <div style={{width:"44px",flexShrink:0,borderRight:"1px solid var(--b)"}}>
+            {[...Array(DAY_END_HOUR-DAY_START_HOUR)].map((_,i)=>(
+              <div key={i} style={{height:HOUR_PX+"px",fontSize:"9px",fontFamily:"var(--mono)",color:"var(--m)",textAlign:"right",paddingRight:"6px",boxSizing:"border-box",borderBottom:"1px solid var(--b)"}}>
+                {String(DAY_START_HOUR+i).padStart(2,"0")}:00
+              </div>
+            ))}
+          </div>
+          {/* Grid + events + drag overlay */}
+          <div ref={gridRef} onMouseDown={onGridMouseDown} onMouseMove={onGridMouseMove} onMouseUp={onGridMouseUp} onMouseLeave={onGridMouseUp}
+            style={{position:"relative",flex:1,cursor:"crosshair",userSelect:"none"}}>
+            {[...Array(DAY_END_HOUR-DAY_START_HOUR)].map((_,i)=>(
+              <div key={i} style={{height:HOUR_PX+"px",borderBottom:"1px solid var(--b)",boxSizing:"border-box"}}/>
+            ))}
+            {/* Existing events for this day, positioned by time */}
+            {allEvents.filter(e=>e.date===ymd(addD(new Date(),dayOff))).map(ev=>{
+              const startMin=timeToMinutes(ev.time)??DAY_START_HOUR*60
+              const endMin=ev.endTime?timeToMinutes(ev.endTime):startMin+60
+              const top=Math.max(0,(startMin-DAY_START_HOUR*60)/60*HOUR_PX)
+              const height=Math.max(18,(endMin-startMin)/60*HOUR_PX)
+              return(
+                <div key={ev.id||ev.title+ev.time}
+                  onClick={e=>{e.stopPropagation();ev.id?setEditEvent(ev):ev.notion_url&&window.open(ev.notion_url,"_blank")}}
+                  title={`${ev.title}${ev.room?" · "+ev.room:""}${ev.id?" — click to edit":""}`}
+                  style={{position:"absolute",top,height,left:"4px",right:"4px",borderRadius:"4px",padding:"3px 6px",overflow:"hidden",
+                    background:(ev.color||"var(--teal)")+"26",borderLeft:"3px solid "+(ev.color||"var(--teal)"),
+                    fontSize:"10px",color:ev.color||"var(--teal)",cursor:(ev.id||ev.notion_url)?"pointer":"default",zIndex:2}}>
+                  <span style={{fontFamily:"var(--mono)",opacity:.85,marginRight:"5px"}}>{ev.time}</span>{ev.title}
+                </div>
+              )
+            })}
+            {/* Live drag-selection highlight */}
+            {dragSel&&(
+              <div style={{position:"absolute",
+                top:(dragSel.startMin-DAY_START_HOUR*60)/60*HOUR_PX,
+                height:Math.max(4,(dragSel.endMin-dragSel.startMin)/60*HOUR_PX),
+                left:"4px",right:"4px",borderRadius:"4px",background:"rgba(212,168,67,.22)",
+                border:"1px dashed var(--amber)",zIndex:3,pointerEvents:"none",
+                fontSize:"9px",fontFamily:"var(--mono)",color:"var(--amber)",padding:"2px 6px"}}>
+                {String(Math.floor(dragSel.startMin/60)).padStart(2,"0")}:{String(dragSel.startMin%60).padStart(2,"0")}
+                {" – "}
+                {String(Math.floor(dragSel.endMin/60)).padStart(2,"0")}:{String(dragSel.endMin%60).padStart(2,"0")}
+              </div>
+            )}
+          </div>
+        </div>
+        </>
+        )}
 
         {/* Edit event — streamlined: click a field, click away, it's saved. No submit button. */}
         {editEvent&&(
@@ -3247,7 +3552,7 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
     function submit(e){
       e.preventDefault()
       if(!f.title) return
-      const p={id:"p_"+Date.now(),...f,status:"Not started",notion_url:null,subprojects:[],files:[]}
+      const p=makeNode(f)
       const np=[...projects,p]
       setProjects(np);setSel(p);setTab("projects")
       save({projects:np});setAddProjOpen(false)
@@ -3351,20 +3656,41 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
     )
   }
   // ── Canvas helpers ────────────────────────────────────────────────────
+  // ── Link preview — cached in memory so toggling a preview open/closed
+  // repeatedly, or revisiting the same link across projects, doesn't refetch.
+  const linkPreviewCache = useRef({})
+  async function fetchLinkPreview(url){
+    if(linkPreviewCache.current[url]) return linkPreviewCache.current[url]
+    if(!apiBase) throw new Error("Not connected")
+    const r = await backendFetch(`/api/link-preview?url=${encodeURIComponent(url)}`)
+    if(!r.ok){ const e=await r.json().catch(()=>({})); throw new Error(e?.error||`Preview failed (${r.status})`) }
+    const data = await r.json()
+    linkPreviewCache.current[url] = data
+    return data
+  }
+
   async function fetchCanvasSummary(){
     if(!apiBase||!creds.some(c=>c.service==="canvas")) return null
     try{ const r=await backendFetch("/api/canvas/summary"); return r.ok?await r.json():null }catch{ return null }
   }
   async function importCanvasCourse(course, deadlines){
+    // Was building task items with {text,due,done} — the actual task renderer
+    // reads {title,deadline,status}, so every Canvas-imported deadline was
+    // rendering blank. makeTask() guarantees the right shape here on.
     const tasks=(deadlines||[])
       .filter(d=>d.course_id===course.id)
-      .map(d=>({id:"ct_"+d.id, text:d.title, due:d.due_at?new Date(d.due_at).toISOString().slice(0,10):null, done:false, kind:"task", meta:d.points?`${d.points}pts`:""}))
+      .map(d=>makeTask({
+        id:"ct_"+d.id, title: d.title + (d.points ? ` (${d.points}pts)` : ""),
+        deadline: d.due_at ? new Date(d.due_at).toISOString().slice(0,10) : null,
+        status:"Not started",
+      }))
     const node={
-      id:"n_canvas_"+course.id, type:"project", title:course.name,
-      emoji:"📚", category:"academic", sections:["tasks","notes"],
-      tasks, notes:`Canvas course: ${course.code}${course.grade?`\nCurrent grade: ${course.grade} (${course.score}%)`:""} `,
-      children:[], files:[], links:[], tables:[], charts:[],
-      status:"In progress", color:"#4B9E82", canvas_course_id:course.id,
+      ...makeNode({
+        id:"n_canvas_"+course.id, title:course.name, emoji:"📚", category:"academic",
+        sections:["tasks","notes"], status:"In progress",
+        notes:`Canvas course: ${course.code}${course.grade?`\nCurrent grade: ${course.grade} (${course.score}%)`:""}`,
+      }),
+      tasks, color:"#4B9E82", canvas_course_id:course.id,
     }
     const np=[node,...projects]
     setProjects(np); save({projects:np}); setSel(node); setTab("projects")
@@ -3421,11 +3747,22 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
       }
       // Project subproject deadlines
       projects.forEach(p=>{
-        (p.subprojects||[]).forEach(sp=>{
+        (p.tasks||[]).forEach(sp=>{
           if(sp.deadline&&sp.status!=="Complete") collected.push({
             id:"sp_"+sp.id, kind:p.category||"Project", title:sp.title,
             when:sp.deadline+"T23:59:00", dateOnly:true, project:p.title, color:(categories[p.category]||{}).color||"var(--amber)", url:null,
           })
+        })
+      })
+      // Project-level timeline (its own start/end span, separate from task deadlines)
+      projects.forEach(p=>{
+        if(p.startDate) collected.push({
+          id:"pstart_"+p.id, kind:p.category||"Project", title:`${p.title} — starts`,
+          when:p.startDate+"T00:00:00", dateOnly:true, project:p.title, color:(categories[p.category]||{}).color||"var(--amber)", url:null,
+        })
+        if(p.endDate) collected.push({
+          id:"pend_"+p.id, kind:p.category||"Project", title:`${p.title} — ends`,
+          when:p.endDate+"T23:59:00", dateOnly:true, project:p.title, color:(categories[p.category]||{}).color||"var(--amber)", url:null,
         })
       })
       collected.sort((a,b)=>new Date(a.when)-new Date(b.when))
@@ -3777,6 +4114,9 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
   function SettingsTab(){
     const [apiInput,setApiInput] = useState(apiBase)
     const [showAdvanced,setShowAdvanced] = useState(false)
+    const [editingCatType,setEditingCatType] = useState(null)   // category key currently expanded for edit
+    const [addingNewCat,setAddingNewCat] = useState(false)
+    const [newCatName,setNewCatName] = useState("")
     const OAUTH_SERVICES = [
       {service:"google_calendar", label:"Google Calendar", connect:()=>{window.location.href=apiBase+"/auth/google/start?scopes=calendar"}},
       {service:"gmail",           label:"Gmail",            connect:()=>{window.location.href=apiBase+"/auth/google/start?scopes=gmail"}},
@@ -3863,7 +4203,121 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
               </div>
             </div>
 
-            {/* Your own infrastructure — Cloudflare BYOC (required for everyone) */}
+            {/* Project types — pure local data, no backend dependency, so this
+                works regardless of BYOC deployment status. This is the "type
+                definition flexibility" that used to only exist buried inside
+                the add-project flow, create-only — now a real manager: rename,
+                recolor, re-icon, edit default sections, delete. */}
+            <div style={{marginBottom:"24px"}}>
+              <Eyebrow style={{marginBottom:"10px"}}>PROJECT TYPES</Eyebrow>
+              <div style={{background:"var(--s1)",border:"1px solid var(--b)",borderRadius:"8px",overflow:"hidden"}}>
+                {Object.entries(categories).map(([key,conf],i,arr)=>{
+                  const inUse = projects.filter(p=>p.category===key).length
+                  const isOther = key==="other"
+                  const isOpen = editingCatType===key
+                  return(
+                    <div key={key} style={{borderBottom:i<arr.length-1?"1px solid var(--b)":"none"}}>
+                      <div style={{display:"flex",alignItems:"center",gap:"9px",padding:"9px 14px"}}>
+                        <LucideIcon name={catIconName(key,categories)} size={13} color={conf.color||"#666"}/>
+                        {isOther?(
+                          <span style={{flex:1,fontSize:"12px",color:"var(--d)"}}>other</span>
+                        ):(
+                          <input defaultValue={key} onBlur={e=>{if(e.target.value.trim()&&e.target.value.trim()!==key) renameCategory(key,e.target.value)}}
+                            style={{flex:1,background:"transparent",border:"none",color:"var(--t)",fontSize:"12px",outline:"none",padding:"2px 0"}}/>
+                        )}
+                        <span style={{fontSize:"9px",fontFamily:"var(--mono)",color:"var(--m)",flexShrink:0}}>{inUse} project{inUse!==1?"s":""}</span>
+                        <button onClick={()=>setEditingCatType(isOpen?null:key)}
+                          style={{fontSize:"9px",fontFamily:"var(--mono)",color:"var(--d)",background:"var(--s2)",border:"1px solid var(--b)",borderRadius:"4px",padding:"3px 8px",cursor:"pointer",flexShrink:0}}>
+                          {isOpen?"close":"edit"}
+                        </button>
+                        {!isOther&&(
+                          <button onClick={()=>deleteCategory(key)}
+                            style={{background:"none",border:"none",cursor:"pointer",color:"var(--m)",padding:0,flexShrink:0}}>
+                            <X size={11}/>
+                          </button>
+                        )}
+                      </div>
+                      {isOpen&&(
+                        <div style={{padding:"0 14px 12px",display:"flex",flexDirection:"column",gap:"8px"}} className="fi">
+                          <div>
+                            <Eyebrow style={{marginBottom:"5px"}}>COLOUR</Eyebrow>
+                            <div style={{display:"flex",flexWrap:"wrap",gap:"5px"}}>
+                              {PROJECT_COLORS.map(c=>(
+                                <button key={c.name} type="button" onClick={()=>updateCategory(key,{color:c.hex})} title={c.name}
+                                  style={{width:"19px",height:"19px",borderRadius:"4px",background:c.hex,cursor:"pointer",
+                                    border:conf.color===c.hex?"2px solid var(--t)":"2px solid transparent"}}/>
+                              ))}
+                            </div>
+                          </div>
+                          <div>
+                            <Eyebrow style={{marginBottom:"5px"}}>ICON</Eyebrow>
+                            <div style={{display:"flex",flexWrap:"wrap",gap:"4px",maxHeight:"78px",overflowY:"auto"}}>
+                              {PICKER_ICONS.map(name=>(
+                                <button key={name} type="button" onClick={()=>updateCategory(key,{icon:name})} title={name}
+                                  style={{width:"24px",height:"24px",display:"flex",alignItems:"center",justifyContent:"center",
+                                    background:catIconName(key,categories)===name?"var(--amber)22":"transparent",
+                                    border:"1px solid",borderColor:catIconName(key,categories)===name?"var(--amber)":"var(--b)",
+                                    borderRadius:"4px",cursor:"pointer"}}>
+                                  <LucideIcon name={name} size={11} color={catIconName(key,categories)===name?"var(--amber)":"var(--d)"}/>
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                          <div>
+                            <Eyebrow style={{marginBottom:"5px"}}>DEFAULT SECTIONS FOR NEW PROJECTS OF THIS TYPE</Eyebrow>
+                            <div style={{display:"flex",flexWrap:"wrap",gap:"5px"}}>
+                              {Object.entries(SECTION_DEFS).map(([k,def])=>{
+                                const on=(conf.sections||[]).includes(k)
+                                return(
+                                  <button key={k} type="button"
+                                    onClick={()=>updateCategory(key,{sections:on?(conf.sections||[]).filter(s=>s!==k):[...(conf.sections||[]),k]})}
+                                    style={{display:"flex",alignItems:"center",gap:"4px",fontSize:"9px",fontFamily:"var(--mono)",padding:"4px 8px",borderRadius:"4px",border:"1px solid",cursor:"pointer",
+                                      borderColor:on?"var(--amber)":"var(--b)",background:on?"rgba(212,168,67,.1)":"transparent",
+                                      color:on?"var(--amber)":"var(--m)"}}>
+                                    <def.Icon size={10} strokeWidth={1.5}/>{def.label}
+                                  </button>
+                                )
+                              })}
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+              {addingNewCat?(
+                <div style={{background:"var(--s1)",border:"1px solid var(--b)",borderRadius:"8px",padding:"12px",marginTop:"8px",display:"flex",gap:"7px",alignItems:"center"}} className="fi">
+                  <input value={newCatName} onChange={e=>setNewCatName(e.target.value)} placeholder="new type name" autoFocus
+                    onKeyDown={e=>{if(e.key==="Enter"&&newCatName.trim()){
+                      const key=newCatName.trim().toLowerCase().replace(/\s+/g,"-")
+                      if(!categories[key]) updateCategory(key,{color:PROJECT_COLORS[Math.floor(Math.random()*PROJECT_COLORS.length)].hex,icon:"File",sections:["tasks"]})
+                      setNewCatName("");setAddingNewCat(false);setEditingCatType(key)
+                    }}}
+                    style={{flex:1,background:"var(--s3)",color:"var(--t)",border:"1px solid var(--b)",borderRadius:"5px",padding:"7px 9px",fontSize:"12px"}}/>
+                  <button onClick={()=>{
+                      if(!newCatName.trim())return
+                      const key=newCatName.trim().toLowerCase().replace(/\s+/g,"-")
+                      if(!categories[key]) updateCategory(key,{color:PROJECT_COLORS[Math.floor(Math.random()*PROJECT_COLORS.length)].hex,icon:"File",sections:["tasks"]})
+                      setNewCatName("");setAddingNewCat(false);setEditingCatType(key)
+                    }}
+                    style={{background:"var(--amber)",color:"#000",border:"none",borderRadius:"5px",padding:"7px 12px",cursor:"pointer",fontSize:"11px",fontWeight:"600"}}>
+                    add
+                  </button>
+                  <button onClick={()=>{setAddingNewCat(false);setNewCatName("")}}
+                    style={{background:"none",border:"1px solid var(--b)",color:"var(--d)",borderRadius:"5px",padding:"7px 10px",cursor:"pointer",fontSize:"11px"}}>
+                    cancel
+                  </button>
+                </div>
+              ):(
+                <button onClick={()=>setAddingNewCat(true)}
+                  style={{fontSize:"10px",fontFamily:"var(--mono)",color:"var(--m)",background:"var(--s1)",border:"1px dashed var(--b)",
+                    borderRadius:"8px",padding:"9px",cursor:"pointer",width:"100%",marginTop:"8px"}}>
+                  + new type
+                </button>
+              )}
+            </div>
+
             <div style={{marginBottom:"24px"}}>
               <Eyebrow style={{marginBottom:"10px"}}>YOUR INFRASTRUCTURE{!deployed&&" — REQUIRED"}</Eyebrow>
               <div style={{background:"var(--s1)",border:deployed?"1px solid var(--b)":"1px solid rgba(212,168,67,.4)",borderRadius:"8px",padding:"14px"}}>
