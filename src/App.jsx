@@ -97,6 +97,7 @@ const SECTION_DEFS = {
   tables:    { label:"Tables",             Icon:LayoutGrid },
   charts:    { label:"Charts",             Icon:BarChart3 },
   timeline:  { label:"Timeline",           Icon:CalendarRange },
+  events:    { label:"Events",             Icon:CalendarDays },
 }
 const LINK_SUGGESTIONS = ["CAD file (Onshape/Fusion)","GitHub repo","Figma board","Google Doc","Tutorial / reference","Shared drive folder","Spotify / SoundCloud track","Product listing"]
 
@@ -226,6 +227,8 @@ function makeNode({ id, type="project", title="Untitled", emoji="📁", category
     tasks: [], tables: [], charts: [], links: [], files: [], children: [],
     notes, color: null,
     startDate: null, endDate: null,   // the project's OWN span — separate from any individual task's start/deadline
+    durationFixed: false,             // when true, moving startDate preserves duration by shifting endDate; when false, duration recalculates from the date gap
+    events: [],                       // calendar events created from this project — real Notion Calendar events (same DB the Calendar tab reads), just also tracked here so the project shows its own schedule
   }
 }
 // Canonical task item — same field names (title/deadline/status) no matter
@@ -249,6 +252,8 @@ function normalizeNode(n){
     tasks, tables: rest.tables||[], charts: rest.charts||[], links: rest.links||[],
     files: rest.files||[], notes: rest.notes||"",
     startDate: rest.startDate ?? null, endDate: rest.endDate ?? null,
+    durationFixed: rest.durationFixed ?? false,
+    events: rest.events || [],
     children: (rest.children||[]).map(normalizeNode),
   }
 }
@@ -356,6 +361,38 @@ const SEED = [
 // ─── Module-level date utilities (used by both CalendarView and DigestView) ───
 function ymd(d){ return d.toISOString().slice(0,10) }
 function addD(d,n){ const x=new Date(d); x.setDate(x.getDate()+n); return x }
+// Advance a date by a Y/M/W/D duration using real calendar arithmetic —
+// setFullYear/setMonth naturally handle variable month/year lengths, so
+// "+1 month" from Jan 31 correctly lands on the right day in Feb/Mar rather
+// than assuming a flat 30-day month.
+function addDuration(startStr, {years=0, months=0, weeks=0, days=0}={}){
+  const d = new Date(startStr+"T00:00:00")
+  d.setFullYear(d.getFullYear()+years)
+  d.setMonth(d.getMonth()+months)
+  d.setDate(d.getDate()+weeks*7+days)
+  return ymd(d)
+}
+// Decompose the gap between two dates into the largest clean calendar units
+// — greedily consumes whole years, then whole months (both calendar-real,
+// not flat day counts), then whatever's left becomes weeks+days. This is
+// what makes duration self-normalizing: feed it a raw end date and it
+// always reduces to the cleanest Y/M/W/D breakdown for that specific span.
+function diffToDuration(startStr, endStr){
+  let start = new Date(startStr+"T00:00:00")
+  const end = new Date(endStr+"T00:00:00")
+  if(end<=start) return {years:0,months:0,weeks:0,days:0}
+  let years=0, months=0
+  while(true){
+    const next=new Date(start); next.setFullYear(next.getFullYear()+1)
+    if(next<=end){ years++; start=next } else break
+  }
+  while(true){
+    const next=new Date(start); next.setMonth(next.getMonth()+1)
+    if(next<=end){ months++; start=next } else break
+  }
+  const remDays = Math.round((end-start)/86400000)
+  return {years, months, weeks:Math.floor(remDays/7), days:remDays%7}
+}
 function getMon(d){ const x=new Date(d); const diff=x.getDay()===0?-6:1-x.getDay(); x.setDate(x.getDate()+diff); x.setHours(0,0,0,0); return x }
 function parseWeeksStr(s){
   if(!s) return []
@@ -478,6 +515,8 @@ input,select,textarea,button{font-family:var(--sans);}
 .processing span{animation:pulse 1s ease-in-out infinite;}
 .hr:hover{background:var(--s2)!important;}
 .nb:hover{background:rgba(255,255,255,.04)!important;}
+.hoverx .hoverx-btn{opacity:0;transition:opacity .12s;}
+.hoverx:hover .hoverx-btn{opacity:1;}
 .link-btn{color:var(--d);text-decoration:none;font-family:var(--mono);font-size:10px;border:1px solid var(--b);border-radius:3px;padding:2px 6px;cursor:pointer;}
 .link-btn:hover{border-color:var(--d);}
 a{color:inherit;}
@@ -486,6 +525,24 @@ a{color:inherit;}
 // ─── Tiny helpers ─────────────────────────────────────────────────────────────
 function Dot({color,size=6}){return<span style={{display:"inline-block",width:size,height:size,borderRadius:"50%",background:color,flexShrink:0}}/>}
 function Eyebrow({children,style={}}){return<div style={{fontSize:"10px",fontFamily:"var(--mono)",color:"var(--d)",letterSpacing:".08em",...style}}>{children}</div>}
+// Section header with a hover-revealed corner X — the whole point of a
+// section being "just addable/removable" is that removing it shouldn't be
+// buried behind a separate disclosure. Hover the header, the X appears,
+// click it, the section is gone (data isn't deleted, just hidden — same as
+// before, just discoverable where you'd actually look for it).
+function SectionHeader({label, onRemove, style={}}){
+  return (
+    <div className="hoverx" style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"10px",...style}}>
+      <Eyebrow>{label}</Eyebrow>
+      {onRemove&&(
+        <button onClick={onRemove} title={`Remove ${label.toLowerCase()} section`} className="hoverx-btn"
+          style={{background:"none",border:"none",cursor:"pointer",color:"var(--m)",padding:0,display:"flex"}}>
+          <X size={11}/>
+        </button>
+      )}
+    </div>
+  )
+}
 function Badge({status}){
   const c=STATUS_COLOR[status]||"#3A3A3A"
   return<span style={{fontSize:"10px",fontFamily:"var(--mono)",color:c,background:c+"22",borderRadius:"3px",padding:"2px 6px",whiteSpace:"nowrap"}}>{status}</span>
@@ -974,6 +1031,26 @@ export default function LifeOS(){
         }
       }
     }
+  }
+
+  // Click-to-edit title — used anywhere a project/page title is shown
+  // (sidebar list, detail header, dashboard cards). Click opens an input,
+  // click away or Enter saves, Escape cancels. Lives at the top App scope
+  // so every component can use it via closure, not just wherever it was
+  // first built.
+  function EditableTitle({p, style={}}){
+    const isEditing = editingTitle===p.id
+    const inputRef = useRef(null)
+    useEffect(()=>{ if(isEditing) setTimeout(()=>inputRef.current?.select(),50) },[isEditing])
+    if(isEditing) return(
+      <input ref={inputRef} defaultValue={p.title}
+        onBlur={e=>renameProject(p.id,e.target.value)}
+        onKeyDown={e=>{if(e.key==="Enter") renameProject(p.id,e.target.value);if(e.key==="Escape") setEditingTitle(null)}}
+        onClick={e=>e.stopPropagation()}
+        style={{...style,background:"var(--s3)",color:"var(--t)",border:"1px solid var(--amber)",
+          borderRadius:"4px",padding:"1px 5px",fontFamily:"var(--sans)",fontWeight:"500",outline:"none",width:"90%"}}/>
+    )
+    return <div style={style} onClick={e=>{e.stopPropagation();setEditingTitle(p.id)}} title="click to rename">{p.title}</div>
   }
 
   // ── Node CRUD — one recursive updater, every helper rides it, and every
@@ -1498,21 +1575,8 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
       )
     }
 
-    // Editable title — double click to rename
-    function EditableTitle({p, style={}}){
-      const isEditing = editingTitle===p.id
-      const inputRef = useRef(null)
-      useEffect(()=>{ if(isEditing) setTimeout(()=>inputRef.current?.select(),50) },[isEditing])
-      if(isEditing) return(
-        <input ref={inputRef} defaultValue={p.title}
-          onBlur={e=>renameProject(p.id,e.target.value)}
-          onKeyDown={e=>{if(e.key==="Enter") renameProject(p.id,e.target.value);if(e.key==="Escape") setEditingTitle(null)}}
-          onClick={e=>e.stopPropagation()}
-          style={{...style,background:"var(--s3)",color:"var(--t)",border:"1px solid var(--amber)",
-            borderRadius:"4px",padding:"1px 5px",fontFamily:"var(--sans)",fontWeight:"500",outline:"none",width:"90%"}}/>
-      )
-      return <div style={style} onDoubleClick={e=>{e.stopPropagation();setEditingTitle(p.id)}} title="double-click to rename">{p.title}</div>
-    }
+    // Editable title lives at the top-level App scope now (see above
+    // renameProject) — accessible from every component, not just Dashboard.
 
     return(
       <div style={{height:"100%",display:"flex",flexDirection:"column",overflow:"hidden"}}>
@@ -1812,6 +1876,17 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
   function Projects(){
     const [previewFor,setPreviewFor] = useState(null)    // link id currently showing a preview card
     const [previewData,setPreviewData] = useState({})     // linkId -> {title,description,image,favicon,domain} | "loading" | "error"
+    const [addingProjEvent,setAddingProjEvent] = useState(false)
+    const [projEventForm,setProjEventForm] = useState({title:"",date:"",time:"",endTime:"",type:"Event"})
+    const [projEventMsg,setProjEventMsg] = useState("")
+    async function submitProjEvent(){
+      if(!projEventForm.title||!projEventForm.date){ setProjEventMsg("Title and date are required."); return }
+      try{
+        await createProjectEvent(sel.id, projEventForm)
+        setProjEventForm({title:"",date:"",time:"",endTime:"",type:"Event"})
+        setAddingProjEvent(false); setProjEventMsg("")
+      }catch(e){ setProjEventMsg(e.message) }
+    }
     async function togglePreview(lk){
       if(previewFor===lk.id){ setPreviewFor(null); return }
       setPreviewFor(lk.id)
@@ -1844,7 +1919,7 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
                   transition:"all .1s"}}
                 className={active?"":"hr"}>
                 <div style={{flex:1,minWidth:0}}>
-                  <div style={{fontSize:"12px",fontWeight:"500",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.title}</div>
+                  <EditableTitle p={p} style={{fontSize:"12px",fontWeight:"500",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}/>
                   <div style={{fontSize:"10px",fontFamily:"var(--mono)",color:cc,marginTop:"1px"}}>{p.category}</div>
                 </div>
                 <Dot color={cc} size={5}/>
@@ -1866,7 +1941,7 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
           const bStats = budgetStats(liveSel)
           const selNode = liveSel
           return (
-          <div style={{overflowY:"auto",padding:"24px 28px"}} className="fi" key={sel.id+(liveSel.notion_last_edited_at||"")}>
+          <div style={{overflowY:"auto",padding:"24px 28px"}} className="fi" key={sel.id}>
             {/* Breadcrumbs — only shown once you're actually inside something */}
             {path.length>1&&(
               <div style={{display:"flex",alignItems:"center",gap:"4px",marginBottom:"12px",flexWrap:"wrap"}}>
@@ -1889,7 +1964,7 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:"22px"}}>
               <div>
                 <div style={{display:"flex",alignItems:"center",gap:"10px",marginBottom:"4px"}}>
-                <span style={{fontSize:"18px",fontWeight:"500"}}>{sel.title}</span>
+                <EditableTitle p={sel} style={{fontSize:"18px",fontWeight:"500"}}/>
               </div>
                 {sel.description&&<div style={{fontSize:"12px",color:"var(--d)",maxWidth:"440px",lineHeight:"1.5"}}>{sel.description}</div>}
               </div>
@@ -1987,7 +2062,7 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
                         borderBottom:i<arr.length-1?"1px solid var(--b)":"none"}} className="hr">
                       {c.type==="page"
                         ?<FileText size={13} color="var(--d)" strokeWidth={1.5}/>
-                        :<LucideIcon name={catIconName(c.category,categories)} size={13} color={CAT_COLOR[c.category]||"var(--d)"}/>}
+                        :<Dot color={CAT_COLOR[c.category]||"var(--d)"} size={7}/>}
                       <span style={{fontSize:"12px",flex:1}}>{c.title}</span>
                       {(c.children||[]).length>0&&<span style={{fontSize:"9px",fontFamily:"var(--mono)",color:"var(--m)"}}>{c.children.length} inside</span>}
                       <button onClick={e=>{e.stopPropagation();if(confirm(`Delete "${c.title}" and everything inside it?`)) deleteChild(selNode.id,c.id)}}
@@ -2002,26 +2077,83 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
             {sectionsOf(sel).includes("timeline")&&<>
             {/* Timeline — the project's OWN start/end span, distinct from
                 individual task dates (which have their own Gantt view under
-                Tasks). This is "when does the whole thing run," e.g. a
-                collection that spans March–June regardless of which specific
-                tasks inside it are scheduled when. */}
+                Tasks). Duration (Y/M/W/D) and the two dates stay in sync:
+                editing duration recomputes the end date; editing the end
+                date recomputes duration; editing the start date either
+                recomputes duration (default) or shifts the end date to
+                preserve duration (when "fixed" is on). */}
             <div style={{marginBottom:"24px"}}>
-              <Eyebrow style={{marginBottom:"10px"}}>TIMELINE</Eyebrow>
+              <SectionHeader label="TIMELINE" onRemove={()=>removeSection(sel.id,"timeline")}/>
               <div style={{background:"var(--s1)",border:"1px solid var(--b)",borderRadius:"8px",padding:"13px 14px"}}>
                 <div style={{display:"flex",gap:"10px",marginBottom:"12px"}}>
                   <div style={{flex:1}}>
                     <Eyebrow style={{marginBottom:"4px"}}>START</Eyebrow>
-                    <input type="date" defaultValue={sel.startDate||""}
-                      onBlur={e=>updateNode(sel.id,p=>({...p,startDate:e.target.value||null}))}
+                    <input type="date" defaultValue={sel.startDate||""} key={"start-"+(sel.startDate||"")}
+                      onBlur={e=>{
+                        const newStart = e.target.value||null
+                        if(!newStart){ updateNode(sel.id,p=>({...p,startDate:null})); return }
+                        if(sel.durationFixed && sel.startDate && sel.endDate){
+                          // Fixed duration: dragging start shifts end to preserve the span
+                          const dur = diffToDuration(sel.startDate, sel.endDate)
+                          updateNode(sel.id,p=>({...p,startDate:newStart,endDate:addDuration(newStart,dur)}))
+                        }else{
+                          // Not fixed: start moves, duration recalculates from whatever end already is
+                          updateNode(sel.id,p=>({...p,startDate:newStart}))
+                        }
+                      }}
                       style={{width:"100%",background:"var(--s3)",color:"var(--t)",border:"1px solid var(--b)",borderRadius:"5px",padding:"6px 8px",fontSize:"11px",colorScheme:"dark"}}/>
                   </div>
                   <div style={{flex:1}}>
                     <Eyebrow style={{marginBottom:"4px"}}>END</Eyebrow>
-                    <input type="date" defaultValue={sel.endDate||""}
+                    <input type="date" defaultValue={sel.endDate||""} key={"end-"+(sel.endDate||"")}
                       onBlur={e=>updateNode(sel.id,p=>({...p,endDate:e.target.value||null}))}
                       style={{width:"100%",background:"var(--s3)",color:"var(--t)",border:"1px solid var(--b)",borderRadius:"5px",padding:"6px 8px",fontSize:"11px",colorScheme:"dark"}}/>
                   </div>
                 </div>
+
+                {/* Duration — self-normalizing: type 6 in weeks, blur, and it
+                    redistributes into the cleanest calendar breakdown (e.g.
+                    "1 month, 2 weeks" if that's what 6 weeks from START
+                    calendar-equals). Only usable once START is set, since
+                    duration needs a reference point to resolve against. */}
+                <div style={{marginBottom:"12px"}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"5px"}}>
+                    <Eyebrow>DURATION</Eyebrow>
+                    <label style={{display:"flex",alignItems:"center",gap:"5px",fontSize:"9px",fontFamily:"var(--mono)",color:"var(--d)",cursor:sel.startDate?"pointer":"default"}}>
+                      <input type="checkbox" checked={!!sel.durationFixed} disabled={!sel.startDate}
+                        onChange={e=>updateNode(sel.id,p=>({...p,durationFixed:e.target.checked}))}
+                        style={{accentColor:"var(--amber)",cursor:sel.startDate?"pointer":"default"}}/>
+                      fixed — moving start keeps this span, shifts end
+                    </label>
+                  </div>
+                  {!sel.startDate?(
+                    <div style={{fontSize:"10px",color:"var(--m)",fontStyle:"italic"}}>Set a start date to use duration.</div>
+                  ):(()=>{
+                    const dur = sel.endDate ? diffToDuration(sel.startDate,sel.endDate) : {years:0,months:0,weeks:0,days:0}
+                    const fields = [["years","Y"],["months","M"],["weeks","W"],["days","D"]]
+                    return(
+                      <div style={{display:"flex",gap:"6px"}} key={"dur-"+(sel.startDate||"")+"-"+(sel.endDate||"")}>
+                        {fields.map(([f,label])=>(
+                          <div key={f} style={{flex:1}}>
+                            <input type="number" min="0" defaultValue={dur[f]}
+                              onBlur={e=>{
+                                const raw = {...dur, [f]:Math.max(0,parseInt(e.target.value)||0)}
+                                // Resolve the raw entry to a real end date, then re-decompose
+                                // into the cleanest calendar units — this IS the auto-sum/
+                                // normalize behavior (6 weeks → 1 month 2 weeks, etc).
+                                const rawEnd = addDuration(sel.startDate, raw)
+                                updateNode(sel.id,p=>({...p,endDate:rawEnd}))
+                              }}
+                              style={{width:"100%",background:"var(--s3)",color:"var(--t)",border:"1px solid var(--b)",borderRadius:"5px",
+                                padding:"6px 4px",fontSize:"12px",textAlign:"center"}}/>
+                            <div style={{fontSize:"8px",fontFamily:"var(--mono)",color:"var(--m)",textAlign:"center",marginTop:"2px"}}>{label}</div>
+                          </div>
+                        ))}
+                      </div>
+                    )
+                  })()}
+                </div>
+
                 {sel.startDate&&sel.endDate?(()=>{
                   const start=new Date(sel.startDate+"T00:00:00"), end=new Date(sel.endDate+"T00:00:00"), today=new Date(); today.setHours(0,0,0,0)
                   const totalDays=Math.max(1,Math.round((end-start)/86400000))
@@ -2052,11 +2184,90 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
             </div>
             </>}
 
+            {sectionsOf(sel).includes("events")&&<>
+            {/* Events — creating one here goes into the SAME Notion Calendar
+                the Calendar tab reads, so it just shows up there too, no
+                separate sync step. This section is the project's own view
+                of what it's got scheduled. */}
+            <div style={{marginBottom:"24px"}}>
+              <SectionHeader label="EVENTS" onRemove={()=>removeSection(sel.id,"events")}/>
+              <div style={{background:"var(--s1)",border:"1px solid var(--b)",borderRadius:"8px",overflow:"hidden",marginBottom:"8px"}}>
+                {(sel.events||[]).length===0&&!addingProjEvent&&(
+                  <div style={{padding:"12px",fontSize:"11px",color:"var(--m)",fontStyle:"italic"}}>Nothing scheduled yet.</div>
+                )}
+                {(sel.events||[]).slice().sort((a,b)=>(a.date+((a.time)||""))<(b.date+((b.time)||""))?-1:1).map((ev,i,arr)=>{
+                  const tc = (eventTypes.find(t=>t.name===ev.type)||{}).hex || "var(--teal)"
+                  return(
+                    <div key={ev.id} style={{display:"flex",alignItems:"center",gap:"9px",padding:"9px 13px",borderBottom:i<arr.length-1?"1px solid var(--b)":"none"}} className="hr">
+                      <span style={{width:"4px",height:"4px",borderRadius:"50%",background:tc,flexShrink:0}}/>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontSize:"12px",color:"var(--t)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{ev.title}</div>
+                        <div style={{fontSize:"9px",fontFamily:"var(--mono)",color:"var(--m)"}}>
+                          {new Date(ev.date+"T00:00:00").toLocaleDateString("en-GB",{day:"numeric",month:"short"})}{ev.time?" · "+ev.time:""}
+                        </div>
+                      </div>
+                      {ev.notion_url&&<a href={ev.notion_url} target="_blank" rel="noreferrer" style={{color:"var(--d)",display:"flex"}}><ExternalLink size={11}/></a>}
+                      <button onClick={()=>deleteProjectEvent(sel.id,ev.id)} style={{background:"none",border:"none",cursor:"pointer",color:"var(--m)",padding:0}}><X size={11}/></button>
+                    </div>
+                  )
+                })}
+              </div>
+              {addingProjEvent?(
+                <div style={{background:"var(--s1)",border:"1px solid var(--b)",borderRadius:"8px",padding:"12px",display:"flex",flexDirection:"column",gap:"7px"}} className="fi">
+                  <input value={projEventForm.title} onChange={e=>setProjEventForm(f=>({...f,title:e.target.value}))} placeholder="Event title"
+                    style={{background:"var(--s3)",color:"var(--t)",border:"1px solid var(--b)",borderRadius:"5px",padding:"7px 9px",fontSize:"12px"}}/>
+                  <div style={{display:"flex",gap:"7px"}}>
+                    <input type="date" value={projEventForm.date} onChange={e=>setProjEventForm(f=>({...f,date:e.target.value}))}
+                      style={{flex:1,background:"var(--s3)",color:"var(--t)",border:"1px solid var(--b)",borderRadius:"5px",padding:"6px 8px",fontSize:"11px",colorScheme:"dark"}}/>
+                    <input type="time" value={projEventForm.time} onChange={e=>setProjEventForm(f=>({...f,time:e.target.value}))}
+                      style={{flex:1,background:"var(--s3)",color:"var(--t)",border:"1px solid var(--b)",borderRadius:"5px",padding:"6px 8px",fontSize:"11px",colorScheme:"dark"}}/>
+                    <input type="time" value={projEventForm.endTime} onChange={e=>setProjEventForm(f=>({...f,endTime:e.target.value}))}
+                      style={{flex:1,background:"var(--s3)",color:"var(--t)",border:"1px solid var(--b)",borderRadius:"5px",padding:"6px 8px",fontSize:"11px",colorScheme:"dark"}}/>
+                  </div>
+                  <div style={{display:"flex",flexWrap:"wrap",gap:"5px"}}>
+                    {eventTypes.map(t=>(
+                      <button key={t.name} type="button" onClick={()=>setProjEventForm(f=>({...f,type:t.name}))}
+                        style={{fontSize:"10px",fontFamily:"var(--mono)",padding:"4px 8px",borderRadius:"4px",border:"1px solid",cursor:"pointer",
+                          borderColor:projEventForm.type===t.name?t.hex:"var(--b)",
+                          background:projEventForm.type===t.name?t.hex+"22":"transparent",
+                          color:projEventForm.type===t.name?t.hex:"var(--d)"}}>
+                        {t.name}
+                      </button>
+                    ))}
+                  </div>
+                  {projEventMsg&&<div style={{fontSize:"10px",fontFamily:"var(--mono)",color:"var(--amber)"}}>{projEventMsg}</div>}
+                  <div style={{display:"flex",gap:"8px"}}>
+                    <button onClick={()=>{setAddingProjEvent(false);setProjEventMsg("")}}
+                      style={{flex:1,background:"transparent",border:"1px solid var(--b)",color:"var(--d)",borderRadius:"5px",padding:"7px",cursor:"pointer",fontSize:"11px"}}>
+                      cancel
+                    </button>
+                    <button onClick={submitProjEvent}
+                      style={{flex:1,background:"var(--amber)",color:"#000",border:"none",borderRadius:"5px",padding:"7px",cursor:"pointer",fontSize:"11px",fontWeight:"600"}}>
+                      add event
+                    </button>
+                  </div>
+                </div>
+              ):(
+                <button onClick={()=>setAddingProjEvent(true)}
+                  style={{fontSize:"10px",fontFamily:"var(--mono)",color:"var(--m)",background:"var(--s1)",border:"1px dashed var(--b)",
+                    borderRadius:"8px",padding:"9px",cursor:"pointer",width:"100%"}}>
+                  + add event
+                </button>
+              )}
+            </div>
+            </>}
+
             {sectionsOf(sel).includes("tasks")&&<>
             {/* Tasks */}
             <div style={{marginBottom:"24px"}}>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"10px",flexWrap:"wrap",gap:"8px"}}>
-                <Eyebrow>TASKS</Eyebrow>
+                <span className="hoverx" style={{display:"flex",alignItems:"center",gap:"6px"}}>
+                  <Eyebrow>TASKS</Eyebrow>
+                  <button onClick={()=>removeSection(sel.id,"tasks")} title="Remove tasks section" className="hoverx-btn"
+                    style={{background:"none",border:"none",cursor:"pointer",color:"var(--m)",padding:0,display:"flex"}}>
+                    <X size={10}/>
+                  </button>
+                </span>
                 <div style={{display:"flex",gap:"10px",alignItems:"center",flexWrap:"wrap"}}>
                   <div style={{display:"flex",gap:"4px"}}>
                     {["all","task","issue"].map(k=>(
@@ -2202,7 +2413,7 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
                 forces its use. Expenses log independent of a budget; setting
                 one additionally turns on the spend-vs-budget math. */}
             <div style={{marginBottom:"24px"}}>
-              <Eyebrow style={{marginBottom:"10px"}}>BUDGET & EXPENSES</Eyebrow>
+              <SectionHeader label="BUDGET & EXPENSES" onRemove={()=>removeSection(sel.id,"budget")}/>
 
               <div style={{background:"var(--s1)",border:"1px solid var(--b)",borderRadius:"8px",padding:"14px",marginBottom:"10px"}}>
                 {bStats.hasBudget?(
@@ -2268,7 +2479,7 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
 
             {sectionsOf(sel).includes("resources")&&<>
             <div style={{marginBottom:"24px"}}>
-              <Eyebrow style={{marginBottom:"10px"}}>PEOPLE & RESOURCES</Eyebrow>
+              <SectionHeader label="PEOPLE & RESOURCES" onRemove={()=>removeSection(sel.id,"resources")}/>
               <div style={{background:"var(--s1)",border:"1px solid var(--b)",borderRadius:"8px",overflow:"hidden"}}>
                 {(sel.resources||[]).length===0?(
                   <button onClick={()=>addResource(sel.id,{id:"r_"+Date.now(),name:"",role:""})}
@@ -2300,7 +2511,7 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
 
             {sectionsOf(sel).includes("links")&&<>
             <div style={{marginBottom:"24px"}}>
-              <Eyebrow style={{marginBottom:"10px"}}>LINKS</Eyebrow>
+              <SectionHeader label="LINKS" onRemove={()=>removeSection(sel.id,"links")}/>
               <div style={{background:"var(--s1)",border:"1px solid var(--b)",borderRadius:"8px",overflow:"hidden"}}>
                 {(sel.links||[]).map((lk,i,arr)=>{
                   const isPreviewOpen = previewFor===lk.id
@@ -2376,7 +2587,7 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
 
             {sectionsOf(sel).includes("notes")&&<>
             <div style={{marginBottom:"24px"}}>
-              <Eyebrow style={{marginBottom:"10px"}}>NOTES</Eyebrow>
+              <SectionHeader label="NOTES" onRemove={()=>removeSection(sel.id,"notes")}/>
               <textarea defaultValue={sel.notes||""} placeholder="Freeform notes for this project…"
                 onBlur={e=>updateNotes(sel.id,e.target.value)}
                 style={{width:"100%",minHeight:"110px",background:"var(--s1)",border:"1px solid var(--b)",borderRadius:"8px",
@@ -2386,7 +2597,7 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
 
             {sectionsOf(sel).includes("tables")&&<>
             <div style={{marginBottom:"24px"}}>
-              <Eyebrow style={{marginBottom:"10px"}}>TABLES</Eyebrow>
+              <SectionHeader label="TABLES" onRemove={()=>removeSection(sel.id,"tables")}/>
               {(sel.tables||[]).map(tb=>(
                 <div key={tb.id} style={{background:"var(--s1)",border:"1px solid var(--b)",borderRadius:"8px",overflow:"hidden",marginBottom:"10px"}}>
                   <div style={{display:"flex",alignItems:"center",gap:"8px",padding:"8px 12px",borderBottom:"1px solid var(--b)"}}>
@@ -2443,7 +2654,7 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
 
             {sectionsOf(sel).includes("charts")&&<>
             <div style={{marginBottom:"24px"}}>
-              <Eyebrow style={{marginBottom:"10px"}}>CHARTS</Eyebrow>
+              <SectionHeader label="CHARTS" onRemove={()=>removeSection(sel.id,"charts")}/>
               {(sel.charts||[]).map(ch=>{
                 const tb=(sel.tables||[]).find(t=>t.id===ch.tableId)
                 const labelIdx=tb?tb.cols.indexOf(ch.labelCol):-1
@@ -2501,7 +2712,13 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
             {/* Files */}
             <div>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"10px"}}>
-                <Eyebrow>FILES & POINTERS</Eyebrow>
+                <span className="hoverx" style={{display:"flex",alignItems:"center",gap:"6px"}}>
+                  <Eyebrow>FILES & POINTERS</Eyebrow>
+                  <button onClick={()=>removeSection(sel.id,"files")} title="Remove files section" className="hoverx-btn"
+                    style={{background:"none",border:"none",cursor:"pointer",color:"var(--m)",padding:0,display:"flex"}}>
+                    <X size={10}/>
+                  </button>
+                </span>
                 <button onClick={()=>setAddFileFor(sel.id)}
                   style={{fontSize:"10px",fontFamily:"var(--mono)",color:"var(--d)",background:"var(--s2)",
                     border:"1px solid var(--b)",borderRadius:"4px",padding:"3px 8px",cursor:"pointer"}}>
@@ -2544,7 +2761,7 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
               <button onClick={()=>addChild(sel.id,"project")}
                 style={{display:"flex",alignItems:"center",gap:"5px",fontSize:"10px",fontFamily:"var(--mono)",color:"var(--amber)",
                   background:"rgba(212,168,67,.07)",border:"1px dashed rgba(212,168,67,.4)",borderRadius:"999px",padding:"5px 10px",cursor:"pointer"}}>
-                <Layers size={11} strokeWidth={1.5}/> + sub-project
+                <Layers size={11} strokeWidth={1.5}/> + project
               </button>
               <button onClick={()=>addChild(sel.id,"page")}
                 style={{display:"flex",alignItems:"center",gap:"5px",fontSize:"10px",fontFamily:"var(--mono)",color:"var(--amber)",
@@ -2558,23 +2775,6 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
                   <def.Icon size={11} strokeWidth={1.5}/> + {def.label}
                 </button>
               ))}
-              {sectionsOf(sel).length>0&&(
-                <div style={{position:"relative"}} className="section-remove-wrap">
-                  <details>
-                    <summary style={{display:"flex",alignItems:"center",gap:"4px",fontSize:"9px",fontFamily:"var(--mono)",color:"var(--m)",
-                      cursor:"pointer",listStyle:"none",padding:"5px 4px"}}>remove a section</summary>
-                    <div style={{display:"flex",flexWrap:"wrap",gap:"6px",marginTop:"6px"}}>
-                      {sectionsOf(sel).map(k=>(
-                        <button key={k} onClick={()=>removeSection(sel.id,k)}
-                          style={{fontSize:"9px",fontFamily:"var(--mono)",color:"var(--m)",background:"none",
-                            border:"1px solid var(--b)",borderRadius:"999px",padding:"4px 8px",cursor:"pointer"}}>
-                          {SECTION_DEFS[k]?.label||k} ×
-                        </button>
-                      ))}
-                    </div>
-                  </details>
-                </div>
-              )}
             </div>
 
             {/* Revision history — only shown when there's something to show.
@@ -2810,6 +3010,25 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
     })
     if (!r.ok) { const e = await r.json().catch(()=>({})); throw new Error(e?.message || `Notion ${r.status}`) }
     return r.json()
+  }
+
+  // ── Create an event FROM a project's context. This is the exact same
+  // Notion Calendar the Calendar tab reads — creating it here means it just
+  // shows up there automatically, no separate sync step. The only thing
+  // added is a lightweight local record so the project can show its own
+  // schedule without re-querying Notion every time it's opened.
+  async function createProjectEvent(projId, form){
+    const result = await notionCalCreate(form)
+    const record = {
+      id: result.id, title: form.title, date: form.date, time: form.time||null,
+      endTime: form.endTime||null, type: form.type||"Event", notion_url: result.url||null,
+    }
+    updateNode(projId, p=>({...p, events:[...(p.events||[]), record]}))
+    return record
+  }
+  async function deleteProjectEvent(projId, eventId){
+    try{ await notionCalDelete(eventId) }catch{}   // best-effort — still remove locally even if Notion delete fails (e.g. already deleted there)
+    updateNode(projId, p=>({...p, events:(p.events||[]).filter(e=>e.id!==eventId)}))
   }
 
   // ── Event types — read straight from Notion's own schema, not a separate
@@ -3368,6 +3587,16 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
         </div>
 
         {!apiBase && <div style={{fontSize:"12px",color:"var(--m)",fontStyle:"italic",marginBottom:"12px",flexShrink:0}}>Set up your backend in Settings to see your real digest.</div>}
+        {apiBase && !creds.some(c=>c.service==="gemini") && (
+          <div style={{fontSize:"11px",color:"var(--amber)",background:"rgba(212,168,67,.08)",border:"1px solid rgba(212,168,67,.25)",
+            borderRadius:"6px",padding:"9px 12px",marginBottom:"12px",flexShrink:0,display:"flex",justifyContent:"space-between",alignItems:"center",gap:"10px"}}>
+            <span>The digest needs Gemini connected to generate anything — right now it hasn't run at all.</span>
+            <button onClick={()=>setTab("settings")}
+              style={{fontSize:"10px",fontFamily:"var(--mono)",color:"#000",background:"var(--amber)",border:"none",borderRadius:"4px",padding:"4px 10px",cursor:"pointer",flexShrink:0,whiteSpace:"nowrap"}}>
+              Connect Gemini
+            </button>
+          </div>
+        )}
         {briefingErr && <div style={{fontSize:"11px",fontFamily:"var(--mono)",color:"var(--red)",marginBottom:"10px",padding:"7px 10px",background:"rgba(192,90,74,.08)",borderRadius:"5px",flexShrink:0}}>{briefingErr}</div>}
 
         {/* Today (left) + Worth knowing (right) — each scrolls independently */}
@@ -3384,7 +3613,7 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
                   </div>
                   {a.context&&<div style={{fontSize:"11px",color:"var(--d)",marginTop:"3px",lineHeight:"1.5"}}>{a.context}</div>}
                 </div>
-              )) : !briefingLoading && <div style={{fontSize:"12px",color:"var(--m)",fontStyle:"italic",padding:"10px 0"}}>Nothing on today.</div>}
+              )) : !briefingLoading && creds.some(c=>c.service==="gemini") && <div style={{fontSize:"12px",color:"var(--m)",fontStyle:"italic",padding:"10px 0"}}>Nothing on today.</div>}
             </div>
           </div>
 
@@ -3396,7 +3625,7 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
                   <span style={{color:"var(--amber)",fontSize:"10px",paddingTop:"2px"}}>▸</span>
                   <span style={{fontSize:"12px",lineHeight:"1.5"}}>{ins.text}</span>
                 </div>
-              )) : !briefingLoading && <div style={{fontSize:"12px",color:"var(--m)",fontStyle:"italic",padding:"6px 0 10px"}}>Nothing flagged — quiet day.</div>}
+              )) : !briefingLoading && creds.some(c=>c.service==="gemini") && <div style={{fontSize:"12px",color:"var(--m)",fontStyle:"italic",padding:"6px 0 10px"}}>Nothing flagged — quiet day.</div>}
 
               {upcoming.length>0&&(
                 <div style={{marginTop:"10px",paddingTop:"9px",borderTop:"1px solid var(--b)"}}>
@@ -4216,9 +4445,9 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
                   const isOther = key==="other"
                   const isOpen = editingCatType===key
                   return(
-                    <div key={key} style={{borderBottom:i<arr.length-1?"1px solid var(--b)":"none"}}>
+                    <div key={key} style={{borderBottom:i<arr.length-1?"1px solid var(--b)":"none"}} className="hoverx">
                       <div style={{display:"flex",alignItems:"center",gap:"9px",padding:"9px 14px"}}>
-                        <LucideIcon name={catIconName(key,categories)} size={13} color={conf.color||"#666"}/>
+                        <Dot color={conf.color||"#666"} size={9}/>
                         {isOther?(
                           <span style={{flex:1,fontSize:"12px",color:"var(--d)"}}>other</span>
                         ):(
@@ -4231,7 +4460,7 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
                           {isOpen?"close":"edit"}
                         </button>
                         {!isOther&&(
-                          <button onClick={()=>deleteCategory(key)}
+                          <button onClick={()=>deleteCategory(key)} className="hoverx-btn"
                             style={{background:"none",border:"none",cursor:"pointer",color:"var(--m)",padding:0,flexShrink:0}}>
                             <X size={11}/>
                           </button>
@@ -4246,20 +4475,6 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
                                 <button key={c.name} type="button" onClick={()=>updateCategory(key,{color:c.hex})} title={c.name}
                                   style={{width:"19px",height:"19px",borderRadius:"4px",background:c.hex,cursor:"pointer",
                                     border:conf.color===c.hex?"2px solid var(--t)":"2px solid transparent"}}/>
-                              ))}
-                            </div>
-                          </div>
-                          <div>
-                            <Eyebrow style={{marginBottom:"5px"}}>ICON</Eyebrow>
-                            <div style={{display:"flex",flexWrap:"wrap",gap:"4px",maxHeight:"78px",overflowY:"auto"}}>
-                              {PICKER_ICONS.map(name=>(
-                                <button key={name} type="button" onClick={()=>updateCategory(key,{icon:name})} title={name}
-                                  style={{width:"24px",height:"24px",display:"flex",alignItems:"center",justifyContent:"center",
-                                    background:catIconName(key,categories)===name?"var(--amber)22":"transparent",
-                                    border:"1px solid",borderColor:catIconName(key,categories)===name?"var(--amber)":"var(--b)",
-                                    borderRadius:"4px",cursor:"pointer"}}>
-                                  <LucideIcon name={name} size={11} color={catIconName(key,categories)===name?"var(--amber)":"var(--d)"}/>
-                                </button>
                               ))}
                             </div>
                           </div>
@@ -4291,14 +4506,14 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
                   <input value={newCatName} onChange={e=>setNewCatName(e.target.value)} placeholder="new type name" autoFocus
                     onKeyDown={e=>{if(e.key==="Enter"&&newCatName.trim()){
                       const key=newCatName.trim().toLowerCase().replace(/\s+/g,"-")
-                      if(!categories[key]) updateCategory(key,{color:PROJECT_COLORS[Math.floor(Math.random()*PROJECT_COLORS.length)].hex,icon:"File",sections:["tasks"]})
+                      if(!categories[key]) updateCategory(key,{color:PROJECT_COLORS[Math.floor(Math.random()*PROJECT_COLORS.length)].hex,sections:["tasks"]})
                       setNewCatName("");setAddingNewCat(false);setEditingCatType(key)
                     }}}
                     style={{flex:1,background:"var(--s3)",color:"var(--t)",border:"1px solid var(--b)",borderRadius:"5px",padding:"7px 9px",fontSize:"12px"}}/>
                   <button onClick={()=>{
                       if(!newCatName.trim())return
                       const key=newCatName.trim().toLowerCase().replace(/\s+/g,"-")
-                      if(!categories[key]) updateCategory(key,{color:PROJECT_COLORS[Math.floor(Math.random()*PROJECT_COLORS.length)].hex,icon:"File",sections:["tasks"]})
+                      if(!categories[key]) updateCategory(key,{color:PROJECT_COLORS[Math.floor(Math.random()*PROJECT_COLORS.length)].hex,sections:["tasks"]})
                       setNewCatName("");setAddingNewCat(false);setEditingCatType(key)
                     }}
                     style={{background:"var(--amber)",color:"#000",border:"none",borderRadius:"5px",padding:"7px 12px",cursor:"pointer",fontSize:"11px",fontWeight:"600"}}>
