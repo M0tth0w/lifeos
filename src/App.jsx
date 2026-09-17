@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react"
+import * as XLSX from "xlsx"
 import {
   LayoutDashboard, Layers, FolderOpen, CalendarDays, AlignLeft, Settings,
   Plus, X, ExternalLink, Check, Link2, FileText, Folder, FolderTree,
@@ -89,7 +90,7 @@ const DEFAULT_CATS = {
 // Notion-as-database architecture work and deliberately not bundled in here.
 const SECTION_DEFS = {
   tasks:     { label:"Tasks",              Icon:List },
-  budget:    { label:"Budget & Expenses",  Icon:Wallet },
+  budget:    { label:"Accounting",         Icon:Wallet },
   files:     { label:"Files",              Icon:FolderOpen },
   links:     { label:"Links",              Icon:Link2 },
   resources: { label:"People & Resources", Icon:Users },
@@ -192,7 +193,7 @@ const STATUS_COLOR = {
 // ─── Projects-upgrade: priority, milestones, issues, budget ──────────────────
 // Every project gets these capabilities for free, but nothing forces their
 // use — a project with no budget set and no resources added just never
-// shows that section. See taskDefaults/budgetStats below.
+// shows that section. See taskDefaults/accountingStats below.
 //
 // Priority is signaled by amber INTENSITY, not a rainbow of hues — stays
 // inside the existing dark+amber palette. Teal and red keep their original,
@@ -229,6 +230,8 @@ function makeNode({ id, type="project", title="Untitled", emoji="📁", category
     startDate: null, endDate: null,   // the project's OWN span — separate from any individual task's start/deadline
     durationFixed: false,             // when true, moving startDate preserves duration by shifting endDate; when false, duration recalculates from the date gap
     events: [],                       // calendar events created from this project — real Notion Calendar events (same DB the Calendar tab reads), just also tracked here so the project shows its own schedule
+    ledger: [], budget: null,         // accounting — expense AND revenue entries, running balance computed from both; budget is an optional spend cap, separate from actual ledger activity
+    taskSort: "time-till", eventSort: "date", ledgerSort: "date",  // per-section sort preference — persisted per project since "always sorted this way" is more useful than resetting every visit
   }
 }
 // Canonical task item — same field names (title/deadline/status) no matter
@@ -245,7 +248,7 @@ function makeTask({ id, title="New task", status="Not started", deadline=null, .
 function normalizeNode(n){
   if(!n) return n
   const tasks = n.tasks || n.subprojects || []
-  const { subprojects, ...rest } = n
+  const { subprojects, expenses, ...rest } = n
   return {
     ...rest,
     type: rest.type || "project",
@@ -254,6 +257,12 @@ function normalizeNode(n){
     startDate: rest.startDate ?? null, endDate: rest.endDate ?? null,
     durationFixed: rest.durationFixed ?? false,
     events: rest.events || [],
+    // expenses → ledger: old entries were always expenses (no revenue concept
+    // existed before), so they migrate straight across with kind:"expense"
+    // and no quantity/unitPrice (those are new, optional fields).
+    ledger: rest.ledger || (expenses||[]).map(e=>({...e, kind:"expense", quantity:null, unitPrice:null})),
+    budget: rest.budget ?? null,
+    taskSort: rest.taskSort || "time-till", eventSort: rest.eventSort || "date", ledgerSort: rest.ledgerSort || "date",
     children: (rest.children||[]).map(normalizeNode),
   }
 }
@@ -281,13 +290,96 @@ function findPathInTree(nodes, id, trail=[]){
   }
   return null
 }
+// Fuzzy name search across the WHOLE tree (root + every nested level) — the
+// old command-bar actions only ever searched projects.find(...) at root,
+// which is why "add a task to the sub-project called X inside Y" never
+// worked. This walks everything.
+function findInTreeByName(nodes, name){
+  if(!name) return null
+  const needle = name.toLowerCase()
+  for(const n of nodes){
+    if(n.id===name || n.title?.toLowerCase().includes(needle)) return n
+    if(n.children?.length){ const f=findInTreeByName(n.children,name); if(f) return f }
+  }
+  return null
+}
 
-function budgetStats(p){
-  const expenses = p.expenses||[]
-  const spent = expenses.reduce((s,e)=>s+(Number(e.amount)||0),0)
+function accountingStats(p){
+  const ledger = p.ledger||[]
+  const totalExpense = ledger.filter(e=>e.kind!=="revenue").reduce((s,e)=>s+(Number(e.amount)||0),0)
+  const totalRevenue = ledger.filter(e=>e.kind==="revenue").reduce((s,e)=>s+(Number(e.amount)||0),0)
+  const balance = totalRevenue - totalExpense
   const budget = Number(p.budget)||0
-  const pct = budget>0 ? Math.round((spent/budget)*100) : null
-  return { spent, budget, pct, over: budget>0 && spent>budget, hasBudget: budget>0 }
+  const pct = budget>0 ? Math.round((totalExpense/budget)*100) : null
+  return { totalExpense, totalRevenue, balance, budget, pct, over: budget>0 && totalExpense>budget, hasBudget: budget>0 }
+}
+
+// ─── Per-section sorting — each section gets options that fit ITS data,
+// not one generic sort dropdown pasted everywhere. Preference persists per
+// project (it's a project setting, not a one-off view toggle) since
+// "always sorted this way" beats resetting every time you open it.
+const TASK_SORT_OPTIONS = [
+  { key:"time-till", label:"Time till deadline" },
+  { key:"duration",  label:"Duration (longest first)" },
+  { key:"priority",  label:"Priority" },
+  { key:"status",    label:"Status" },
+  { key:"alpha",     label:"A–Z" },
+]
+function sortTasks(tasks, sortKey){
+  const sorted = [...tasks]
+  const PRIORITY_RANK = { high:0, medium:1, low:2 }
+  const STATUS_RANK = { "In progress":0, "Not started":1, "Complete":2 }
+  if(sortKey==="duration") return sorted.sort((a,b)=>{
+    const da = a.start&&a.deadline ? new Date(a.deadline)-new Date(a.start) : -Infinity
+    const db = b.start&&b.deadline ? new Date(b.deadline)-new Date(b.start) : -Infinity
+    return db-da
+  })
+  if(sortKey==="priority") return sorted.sort((a,b)=>(PRIORITY_RANK[a.priority]??3)-(PRIORITY_RANK[b.priority]??3))
+  if(sortKey==="status") return sorted.sort((a,b)=>(STATUS_RANK[a.status]??3)-(STATUS_RANK[b.status]??3))
+  if(sortKey==="alpha") return sorted.sort((a,b)=>a.title.localeCompare(b.title))
+  return sorted.sort((a,b)=>{   // time-till — default
+    if(!a.deadline&&!b.deadline) return 0
+    if(!a.deadline) return 1
+    if(!b.deadline) return -1
+    return new Date(a.deadline)-new Date(b.deadline)
+  })
+}
+
+const EVENT_SORT_OPTIONS = [
+  { key:"date",      label:"Soonest first" },
+  { key:"date-desc", label:"Furthest first" },
+  { key:"alpha",     label:"A–Z" },
+]
+function sortEvents(events, sortKey){
+  const sorted = [...events]
+  const stamp = e => e.date + (e.time||"")
+  if(sortKey==="date-desc") return sorted.sort((a,b)=>stamp(b)>stamp(a)?1:-1)
+  if(sortKey==="alpha") return sorted.sort((a,b)=>a.title.localeCompare(b.title))
+  return sorted.sort((a,b)=>stamp(a)>stamp(b)?1:-1)   // date — default, soonest first
+}
+
+const LEDGER_SORT_OPTIONS = [
+  { key:"date",   label:"Most recent" },
+  { key:"amount", label:"Largest amount" },
+  { key:"kind",   label:"Expenses / Revenue" },
+]
+function sortLedger(entries, sortKey){
+  const sorted = [...entries]
+  if(sortKey==="amount") return sorted.sort((a,b)=>(Number(b.amount)||0)-(Number(a.amount)||0))
+  if(sortKey==="kind") return sorted.sort((a,b)=>(a.kind==="revenue"?0:1)-(b.kind==="revenue"?0:1))
+  return sorted.sort((a,b)=>(b.date||"")>(a.date||"")?1:-1)   // date — default, most recent first
+}
+
+// Compact dropdown used by all three sections above — same control, each
+// section just passes its own options and its own persisted value.
+function SortPicker({value, options, onChange}){
+  return (
+    <select value={value} onChange={e=>onChange(e.target.value)} title="Sort by"
+      style={{fontSize:"9px",fontFamily:"var(--mono)",color:"var(--d)",background:"var(--s2)",
+        border:"1px solid var(--b)",borderRadius:"4px",padding:"3px 6px",cursor:"pointer"}}>
+      {options.map(o=><option key={o.key} value={o.key}>{o.label}</option>)}
+    </select>
+  )
 }
 
 const FILE_ICONS = {
@@ -530,16 +622,27 @@ function Eyebrow({children,style={}}){return<div style={{fontSize:"10px",fontFam
 // buried behind a separate disclosure. Hover the header, the X appears,
 // click it, the section is gone (data isn't deleted, just hidden — same as
 // before, just discoverable where you'd actually look for it).
-function SectionHeader({label, onRemove, style={}}){
+function SectionHeader({label, onRemove, onDragStart, extra, style={}}){
   return (
-    <div className="hoverx" style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"10px",...style}}>
-      <Eyebrow>{label}</Eyebrow>
-      {onRemove&&(
-        <button onClick={onRemove} title={`Remove ${label.toLowerCase()} section`} className="hoverx-btn"
-          style={{background:"none",border:"none",cursor:"pointer",color:"var(--m)",padding:0,display:"flex"}}>
-          <X size={11}/>
-        </button>
-      )}
+    <div className="hoverx" style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"10px",flexWrap:"wrap",gap:"8px",...style}}>
+      <span style={{display:"flex",alignItems:"center",gap:"5px"}}>
+        {onDragStart&&(
+          <span draggable onDragStart={onDragStart} title="Drag to reorder" className="hoverx-btn"
+            style={{cursor:"grab",display:"flex",color:"var(--m)"}}>
+            <GripVertical size={11}/>
+          </span>
+        )}
+        <Eyebrow>{label}</Eyebrow>
+      </span>
+      <span style={{display:"flex",alignItems:"center",gap:"8px"}}>
+        {extra}
+        {onRemove&&(
+          <button onClick={onRemove} title={`Remove ${label.toLowerCase()} section`} className="hoverx-btn"
+            style={{background:"none",border:"none",cursor:"pointer",color:"var(--m)",padding:0,display:"flex"}}>
+            <X size={11}/>
+          </button>
+        )}
+      </span>
     </div>
   )
 }
@@ -1069,9 +1172,9 @@ export default function LifeOS(){
   }
   function deleteTask(projId, taskId){ updateNode(projId, p=>({...p,tasks:(p.tasks||[]).filter(x=>x.id!==taskId)})) }
   function setBudget(projId, budget){ updateNode(projId, p=>({...p,budget})) }
-  function addExpense(projId, expense){ updateNode(projId, p=>({...p,expenses:[...(p.expenses||[]),expense]})) }
-  function updateExpense(projId, expId, changes){ updateNode(projId, p=>({...p,expenses:(p.expenses||[]).map(x=>x.id===expId?{...x,...changes}:x)})) }
-  function deleteExpense(projId, expId){ updateNode(projId, p=>({...p,expenses:(p.expenses||[]).filter(x=>x.id!==expId)})) }
+  function addLedgerEntry(projId, entry){ updateNode(projId, p=>({...p,ledger:[...(p.ledger||[]),entry]})) }
+  function updateLedgerEntry(projId, entryId, changes){ updateNode(projId, p=>({...p,ledger:(p.ledger||[]).map(x=>x.id===entryId?{...x,...changes}:x)})) }
+  function deleteLedgerEntry(projId, entryId){ updateNode(projId, p=>({...p,ledger:(p.ledger||[]).filter(x=>x.id!==entryId)})) }
   function addResource(projId, resource){ updateNode(projId, p=>({...p,resources:[...(p.resources||[]),resource]})) }
   function updateResource(projId, resId, changes){ updateNode(projId, p=>({...p,resources:(p.resources||[]).map(x=>x.id===resId?{...x,...changes}:x)})) }
   function deleteResource(projId, resId){ updateNode(projId, p=>({...p,resources:(p.resources||[]).filter(x=>x.id!==resId)})) }
@@ -1083,6 +1186,20 @@ export default function LifeOS(){
   // Removing a section only hides it — the underlying data stays put, so
   // re-adding brings it right back. Always a safe, undoable click.
   function removeSection(projId, key){ updateNode(projId, p=>({...p,sections:sectionsOf(p).filter(s=>s!==key)})) }
+  // Drag a section onto another to reorder — removes the dragged key from
+  // wherever it was and reinserts it right before the drop target. The
+  // section blocks themselves never move in the JSX (risky to refactor);
+  // each is wrapped in a div whose CSS `order` is its index in this array,
+  // so reordering the array alone is enough to visually reorder everything.
+  function reorderSections(projId, draggedKey, targetKey){
+    if(!draggedKey || draggedKey===targetKey) return
+    updateNode(projId, p=>{
+      const order = sectionsOf(p).filter(s=>s!==draggedKey)
+      const idx = order.indexOf(targetKey)
+      order.splice(idx===-1?order.length:idx, 0, draggedKey)
+      return {...p, sections:order}
+    })
+  }
   function addLink(projId, link){ updateNode(projId, p=>({...p,links:[...(p.links||[]),link]})) }
   function updateLink(projId, linkId, changes){ updateNode(projId, p=>({...p,links:(p.links||[]).map(x=>x.id===linkId?{...x,...changes}:x)})) }
   function deleteLink(projId, linkId){ updateNode(projId, p=>({...p,links:(p.links||[]).filter(x=>x.id!==linkId)})) }
@@ -1396,6 +1513,127 @@ export default function LifeOS(){
   }
 
   // ── Command handler ──────────────────────────────────────────────────
+  // ── AI action executor ──────────────────────────────────────────────────
+  // Every action here is a pure tree operation: (tree, action) -> {tree,
+  // ok, message}. Nothing calls setProjects/setSel directly — the caller
+  // (runCmd) commits the final tree ONCE after the whole sequence finishes,
+  // so a later action in a multi-action request always sees what an
+  // earlier one in the SAME request just created, with no risk of reading
+  // stale state from before the sequence started.
+  //
+  // This fixes the real bug the old single-action system had: every old
+  // handler did `projects.map(p=>p.id===pid...)`, which could only ever
+  // reach root-level projects. Everything below resolves targets via
+  // findInTreeByName and mutates via mapTree, so nested projects and pages
+  // are addressable exactly the same as root ones.
+  function findTaskByName(tasks, name){
+    if(!name) return null
+    const needle=name.toLowerCase()
+    return (tasks||[]).find(t=>t.id===name||t.title?.toLowerCase().includes(needle))||null
+  }
+  // Flattens the WHOLE tree (every depth) into a simple list with breadcrumb
+  // paths, so the Gemini prompt can show it every project AND page that
+  // exists, nested ones included — not just root, which is what made
+  // targeting anything nested impossible before.
+  function flattenTreeForPrompt(tree, trail=[]){
+    let out = []
+    for(const n of tree){
+      out.push({ title:n.title, path:[...trail,n.title].join(" > "), category:n.category, status:n.status,
+        tasks:(n.tasks||[]).map(t=>t.title) })
+      if(n.children?.length) out = out.concat(flattenTreeForPrompt(n.children, [...trail,n.title]))
+    }
+    return out
+  }
+  function applyAction(tree, action){
+    const p = action.params||{}
+    const fail = (msg)=>({tree, ok:false, message:msg})
+
+    if(action.type==="create_project"){
+      const node = makeNode({ title:p.title||"Untitled", emoji:p.emoji||"📁", category:p.category||"other", description:p.description||"" })
+      return { tree:[...tree, node], ok:true, message:`Created project "${node.title}"`, createdId:node.id, createdTitle:node.title }
+    }
+
+    if(action.type==="add_child"){
+      const parent = findInTreeByName(tree, p.parentName)
+      if(!parent) return fail(`Couldn't find a project/page called "${p.parentName}" to add a child to.`)
+      const child = makeNode({ type:p.childType==="page"?"page":"project", title:p.title||"Untitled", category:parent.category||"other" })
+      const newTree = mapTree(tree, parent.id, n=>({...n, children:[...(n.children||[]), child]}))
+      return { tree:newTree, ok:true, message:`Added "${child.title}" inside "${parent.title}"`, createdId:child.id, createdTitle:child.title }
+    }
+
+    if(action.type==="add_task"){
+      const target = findInTreeByName(tree, p.projectName)
+      if(!target) return fail(`Couldn't find a project/page called "${p.projectName}".`)
+      const task = makeTask({ title:p.title||"New task", status:p.status||"Not started", deadline:p.deadline||null,
+        ...(p.priority && {priority:p.priority}), ...(p.start && {start:p.start}) })
+      const newTree = mapTree(tree, target.id, n=>({...n, tasks:[...(n.tasks||[]), task]}))
+      return { tree:newTree, ok:true, message:`Added task "${task.title}" to "${target.title}"` }
+    }
+
+    if(action.type==="edit_task"){
+      const target = findInTreeByName(tree, p.projectName)
+      if(!target) return fail(`Couldn't find a project/page called "${p.projectName}".`)
+      const task = findTaskByName(target.tasks, p.taskName)
+      if(!task) return fail(`Couldn't find a task called "${p.taskName}" in "${target.title}".`)
+      const ch = p.changes||{}
+      const newTree = mapTree(tree, target.id, n=>({...n, tasks:(n.tasks||[]).map(t=>t.id===task.id?{...t,...ch}:t)}))
+      return { tree:newTree, ok:true, message:`Updated task "${task.title}"` }
+    }
+
+    if(action.type==="delete_task"){
+      const target = findInTreeByName(tree, p.projectName)
+      if(!target) return fail(`Couldn't find a project/page called "${p.projectName}".`)
+      const task = findTaskByName(target.tasks, p.taskName)
+      if(!task) return fail(`Couldn't find a task called "${p.taskName}" in "${target.title}".`)
+      const newTree = mapTree(tree, target.id, n=>({...n, tasks:(n.tasks||[]).filter(t=>t.id!==task.id)}))
+      return { tree:newTree, ok:true, message:`Deleted task "${task.title}"` }
+    }
+
+    if(action.type==="edit_project"){
+      const target = findInTreeByName(tree, p.projectName)
+      if(!target) return fail(`Couldn't find a project/page called "${p.projectName}".`)
+      const ch = p.changes||{}
+      const newTree = mapTree(tree, target.id, n=>({...n,
+        ...(ch.title&&{title:ch.title}), ...(ch.category&&{category:ch.category}),
+        ...(ch.status&&{status:ch.status}), ...(ch.description!==undefined&&{description:ch.description})}))
+      return { tree:newTree, ok:true, message:`Updated "${target.title}"` }
+    }
+
+    if(action.type==="delete_node"){
+      const target = findInTreeByName(tree, p.projectName)
+      if(!target) return fail(`Couldn't find a project/page called "${p.projectName}".`)
+      const path = findPathInTree(tree, target.id)
+      let newTree
+      if(path.length===1) newTree = tree.filter(n=>n.id!==target.id)
+      else newTree = mapTree(tree, path[path.length-2].id, n=>({...n, children:(n.children||[]).filter(c=>c.id!==target.id)}))
+      return { tree:newTree, ok:true, message:`Deleted "${target.title}" and everything inside it` }
+    }
+
+    if(action.type==="add_section"||action.type==="remove_section"){
+      const target = findInTreeByName(tree, p.projectName)
+      if(!target) return fail(`Couldn't find a project/page called "${p.projectName}".`)
+      if(!SECTION_DEFS[p.section]) return fail(`"${p.section}" isn't a real section type.`)
+      const current = sectionsOf(target)
+      const newSections = action.type==="add_section"
+        ? (current.includes(p.section)?current:[...current,p.section])
+        : current.filter(s=>s!==p.section)
+      const newTree = mapTree(tree, target.id, n=>({...n, sections:newSections}))
+      return { tree:newTree, ok:true, message:`${action.type==="add_section"?"Added":"Removed"} ${p.section} on "${target.title}"` }
+    }
+
+    if(action.type==="set_timeline"){
+      const target = findInTreeByName(tree, p.projectName)
+      if(!target) return fail(`Couldn't find a project/page called "${p.projectName}".`)
+      const newTree = mapTree(tree, target.id, n=>({...n,
+        ...(p.startDate!==undefined&&{startDate:p.startDate}), ...(p.endDate!==undefined&&{endDate:p.endDate}),
+        ...(p.durationFixed!==undefined&&{durationFixed:!!p.durationFixed}),
+        sections: sectionsOf(n).includes("timeline")?sectionsOf(n):[...sectionsOf(n),"timeline"]}))
+      return { tree:newTree, ok:true, message:`Set timeline for "${target.title}"` }
+    }
+
+    return fail(`Unknown action type "${action.type}".`)
+  }
+
   async function runCmd(e){
     e.preventDefault()
     if(!cmd.trim()||busy) return
@@ -1429,114 +1667,89 @@ export default function LifeOS(){
     if(!apiBase||!creds.some(c=>c.service==="gemini")){setTab("settings");flash("Connect Gemini in Settings first.","warn");return}
     setBusy(true)
     try{
+      // The tree context shown to Gemini includes EVERY project and page at
+      // every depth (with a breadcrumb path), not just root — this is what
+      // makes "add a task to the page called X inside Y" resolvable at all.
+      const treeContext = flattenTreeForPrompt(projects)
       const sys=`You are the intelligence layer of LifeOS, a personal data management OS.
-Current projects: ${JSON.stringify(projects.map(p=>({id:p.id,title:p.title,category:p.category,status:p.status})))}
+Everything that exists right now (every project AND page, at every depth):
+${JSON.stringify(treeContext)}
 Current device: ${device}
 
-Parse the user's natural-language command and return ONLY a JSON object, nothing else.
-Be smart: you can do everything the user can do in the UI, plus more. Prefer action over asking for clarification.
+Parse the user's request and return ONLY a JSON object, nothing else:
 {
-  "type": "create_project"|"add_task"|"add_file"|"edit_project"|"edit_task"|"delete_task"|"update_status"|"respond",
-  "params": { ... },
-  "response": "one short direct sentence"
+  "actions": [ {"type":"...", "params":{...}}, ... ],
+  "response": "one short direct sentence describing what you did (or will do)"
 }
 
-Action params:
-- create_project: {title,emoji,category(brand/engineering/creative/music/academic/other),description}
-- add_task: {projectId(match from list),title,status("Not started"|"In progress"|"Complete"),deadline(YYYY-MM-DD or null)}
-- add_file: {projectId(match from list or null),name,type(audio/doc/stl/pdf/link/image/code/other),device(phone/laptop/pc/tv/cloud),path(url or local path description)}
-- update_status: {projectId,status}
-- edit_project: {projectId, changes:{title?,category?,status?,description?}}
-- edit_task: {projectId, taskId(match by title), changes:{title?,status?,deadline?}}
-- delete_task: {projectId, taskId}
-- respond: {} — for questions, comments, anything that doesn't map to above
+A request can need MULTIPLE actions — do all of them, in order, not just the
+first. "Create 3 projects each with 3 pages inside them" is 12 actions: 3
+create_project, then 9 add_child, each targeting the right parentName. If
+the request only needs one action, "actions" still has exactly one entry.
+If nothing maps to an action (a question, a comment), return an empty
+actions array and just answer in "response".
 
-Be smart: fuzzy-match project titles to IDs, infer categories and types intelligently.`
+Action types and their params — projectName/parentName/taskName are fuzzy-
+matched against titles anywhere in the tree above, not just root:
+- create_project: {title, emoji, category, description} — always root-level
+- add_child: {parentName, title, childType:"project"|"page"} — nests under an existing project/page, any depth
+- add_task: {projectName, title, status, deadline(YYYY-MM-DD|null), priority?, start?}
+- edit_task: {projectName, taskName, changes:{title?,status?,deadline?}}
+- delete_task: {projectName, taskName}
+- edit_project: {projectName, changes:{title?,category?,status?,description?}}
+- delete_node: {projectName} — deletes it AND everything nested inside it, be careful
+- add_section / remove_section: {projectName, section} — section is one of: tasks,budget,files,links,resources,notes,tables,charts,timeline,events
+- set_timeline: {projectName, startDate?, endDate?, durationFixed?}
+
+Be decisive — infer categories, dates, and structure rather than asking for clarification.`
 
       const raw=await gemini(apiBase,me?.deployment?.relay_token,sys,cmd)
-      let action
+      let parsed
       try{
         const clean=raw.replace(/^```json\s*/i,"").replace(/^```\s*/i,"").replace(/```\s*$/i,"").trim()
-        action=JSON.parse(clean)
-      }catch{action={type:"respond",params:{},response:raw.slice(0,200)}}
+        parsed=JSON.parse(clean)
+      }catch{ parsed={actions:[],response:raw.slice(0,200)} }
 
-      let np=[...projects], nf=[...files]
+      const actions = Array.isArray(parsed.actions) ? parsed.actions : (parsed.type ? [parsed] : [])
 
-      if(action.type==="create_project"){
-        const p=makeNode({
-          title: action.params.title||"Untitled", emoji: action.params.emoji||"📁",
-          category: action.params.category||"other", description: action.params.description||"",
-        })
-        np=[...projects,p]
-        setProjects(np)
-        setTab("projects")
-        setSel(p)
-        // Mirror to Notion Project Planner (async, silent on failure)
-        createNotionProject(p).then(created=>{
-          if(created?.url){
-            const withUrl=np.map(x=>x.id===p.id?{...x,notion_url:created.url,notion_page_id:created.pageId}:x)
-            setProjects(withUrl)
-            save({projects:withUrl})
-          }
-        })
-      }else if(action.type==="add_task"){
-        const pid=action.params.projectId
-        const matched=projects.find(p=>p.id===pid||p.title.toLowerCase().includes((pid||"").toLowerCase()))
-        if(matched){
-          np=projects.map(p=>p.id===matched.id
-            ?{...p,tasks:[...p.tasks,{id:"t_"+Date.now(),title:action.params.title,
-              status:action.params.status||"Not started",deadline:action.params.deadline||null}]}
-            :p)
-          setProjects(np)
-          setTab("projects")
-          setSel(np.find(p=>p.id===matched.id))
-        }
-      }else if(action.type==="add_file"){
-        const fp={id:"fp_"+Date.now(),...action.params,createdAt:new Date().toISOString()}
-        nf=[...files,fp]
-        setFiles(nf)
-      }else if(action.type==="update_status"){
-        const pid=action.params.projectId
-        np=projects.map(p=>p.id===pid||p.title.toLowerCase().includes((pid||"").toLowerCase())
-          ?{...p,status:action.params.status}:p)
-        setProjects(np)
-      }else if(action.type==="edit_project"){
-        const pid=action.params.projectId
-        const ch=action.params.changes||{}
-        np=projects.map(p=>{
-          if(p.id===pid||p.title.toLowerCase().includes((pid||"").toLowerCase()))
-            return{...p,...(ch.title&&{title:ch.title}),...(ch.category&&{category:ch.category}),...(ch.status&&{status:ch.status}),...(ch.description!==undefined&&{description:ch.description})}
-          return p
-        })
-        setProjects(np)
-        if(sel){const updated=np.find(p=>p.id===sel.id);if(updated)setSel(updated)}
-      }else if(action.type==="edit_task"){
-        const pid=action.params.projectId
-        const tid=action.params.taskId
-        const ch=action.params.changes||{}
-        np=projects.map(p=>{
-          if(!(p.id===pid||p.title.toLowerCase().includes((pid||"").toLowerCase()))) return p
-          return{...p,tasks:(p.tasks||[]).map(t=>{
-            if(t.id===tid||t.title.toLowerCase().includes((tid||"").toLowerCase()))
-              return{...t,...(ch.title&&{title:ch.title}),...(ch.status&&{status:ch.status}),...(ch.deadline!==undefined&&{deadline:ch.deadline})}
-            return t
-          })}
-        })
-        setProjects(np)
-        if(sel){const updated=np.find(p=>p.id===sel.id);if(updated)setSel(updated)}
-      }else if(action.type==="delete_task"){
-        const pid=action.params.projectId
-        const tid=action.params.taskId
-        np=projects.map(p=>{
-          if(!(p.id===pid||p.title.toLowerCase().includes((pid||"").toLowerCase()))) return p
-          return{...p,tasks:(p.tasks||[]).filter(t=>t.id!==tid&&!t.title.toLowerCase().includes((tid||"").toLowerCase()))}
-        })
-        setProjects(np)
-        if(sel){const updated=np.find(p=>p.id===sel.id);if(updated)setSel(updated)}
+      // Sequential execution on a plain working-tree variable — never reads
+      // `projects` from React state mid-loop, so action 5 always sees what
+      // actions 1-4 in THIS SAME request just did, with zero risk of a
+      // stale closure. Committed to real state exactly once at the end.
+      let workingTree = projects
+      const results = []
+      const notionMirrors = []   // create_project nodes to mirror into Notion after commit
+      for(const action of actions){
+        const outcome = applyAction(workingTree, action)
+        workingTree = outcome.tree
+        results.push({ type:action.type, ok:outcome.ok, message:outcome.message })
+        if(action.type==="create_project" && outcome.ok) notionMirrors.push(outcome.createdId)
       }
 
-      save({projects:np,files:nf})
-      flash(action.response)
+      if(actions.length){
+        setProjects(workingTree)
+        save({projects:workingTree})
+        // Land somewhere sensible: the last node any action actually
+        // touched, if we can still find it in the committed tree.
+        const lastOk = [...results].reverse().find(r=>r.ok)
+        if(lastOk){ setTab("projects") }
+
+        // Mirror any newly-created root projects into Notion (async, silent
+        // on failure) — same as the single-action path always did.
+        for(const id of notionMirrors){
+          const node = findInTree(workingTree, id)
+          if(node) createNotionProject(node).then(created=>{
+            if(created?.url) updateNode(id, n=>({...n, notion_url:created.url, notion_page_id:created.pageId}))
+          })
+        }
+      }
+
+      const failed = results.filter(r=>!r.ok)
+      if(failed.length){
+        flash(`${parsed.response||""} (${failed.length} of ${results.length} action(s) failed: ${failed.map(f=>f.message).join("; ")})`, "warn")
+      }else{
+        flash(parsed.response || (results.length ? `Done — ${results.length} action(s).` : "Okay."))
+      }
       setCmd("")
     }catch(e){flash("Error: "+e.message,"err")}
     finally{setBusy(false)}
@@ -1879,6 +2092,7 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
     const [addingProjEvent,setAddingProjEvent] = useState(false)
     const [projEventForm,setProjEventForm] = useState({title:"",date:"",time:"",endTime:"",type:"Event"})
     const [projEventMsg,setProjEventMsg] = useState("")
+    const [draggedSection,setDraggedSection] = useState(null)
     async function submitProjEvent(){
       if(!projEventForm.title||!projEventForm.date){ setProjEventMsg("Title and date are required."); return }
       try{
@@ -1921,6 +2135,21 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
                 <div style={{flex:1,minWidth:0}}>
                   <EditableTitle p={p} style={{fontSize:"12px",fontWeight:"500",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}/>
                   <div style={{fontSize:"10px",fontFamily:"var(--mono)",color:cc,marginTop:"1px"}}>{p.category}</div>
+                  {p.startDate&&p.endDate&&(()=>{
+                    const start=new Date(p.startDate+"T00:00:00"), end=new Date(p.endDate+"T00:00:00"), today=new Date(); today.setHours(0,0,0,0)
+                    const totalDays=Math.max(1,Math.round((end-start)/86400000))
+                    const pct=Math.max(0,Math.min(100,((today-start)/86400000/totalDays)*100))
+                    const overdue=today>end
+                    const dur = totalDays>=60?`${Math.round(totalDays/30)}mo`:totalDays>=14?`${Math.round(totalDays/7)}w`:`${totalDays}d`
+                    return(
+                      <div style={{display:"flex",alignItems:"center",gap:"5px",marginTop:"4px"}}>
+                        <div style={{flex:1,height:"3px",background:"var(--s3)",borderRadius:"2px",overflow:"hidden"}}>
+                          <div style={{height:"100%",width:pct+"%",background:overdue?"var(--red)":"var(--amber)",borderRadius:"2px"}}/>
+                        </div>
+                        <span style={{fontSize:"8px",fontFamily:"var(--mono)",color:"var(--m)",flexShrink:0}}>{dur}</span>
+                      </div>
+                    )
+                  })()}
                 </div>
                 <Dot color={cc} size={5}/>
               </div>
@@ -1937,8 +2166,8 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
         {sel?(()=>{
           const liveSel = findInTree(projects, sel.id) || sel
           const path = findPathInTree(projects, sel.id) || [liveSel]
-          const visibleTasks = (liveSel.tasks||[]).map(taskDefaults).filter(t=>taskKindFilter==="all"||t.kind===taskKindFilter)
-          const bStats = budgetStats(liveSel)
+          const visibleTasks = sortTasks((liveSel.tasks||[]).map(taskDefaults).filter(t=>taskKindFilter==="all"||t.kind===taskKindFilter), liveSel.taskSort)
+          const bStats = accountingStats(liveSel)
           const selNode = liveSel
           return (
           <div style={{overflowY:"auto",padding:"24px 28px"}} className="fi" key={sel.id}>
@@ -2074,7 +2303,13 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
               </div>
             )}
 
-            {sectionsOf(sel).includes("timeline")&&<>
+            {/* All sections below render in whatever order sel.sections says
+                (via CSS `order`, keyed to array index) — dragging a section
+                header just reorders that array. */}
+            <div style={{display:"flex",flexDirection:"column"}}>
+
+            {sectionsOf(sel).includes("timeline")&&(
+            <div style={{order:sel.sections.indexOf("timeline")}} onDragOver={e=>e.preventDefault()} onDrop={()=>reorderSections(sel.id,draggedSection,"timeline")}>
             {/* Timeline — the project's OWN start/end span, distinct from
                 individual task dates (which have their own Gantt view under
                 Tasks). Duration (Y/M/W/D) and the two dates stay in sync:
@@ -2083,7 +2318,7 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
                 recomputes duration (default) or shifts the end date to
                 preserve duration (when "fixed" is on). */}
             <div style={{marginBottom:"24px"}}>
-              <SectionHeader label="TIMELINE" onRemove={()=>removeSection(sel.id,"timeline")}/>
+              <SectionHeader label="TIMELINE" onRemove={()=>removeSection(sel.id,"timeline")} onDragStart={()=>setDraggedSection("timeline")}/>
               <div style={{background:"var(--s1)",border:"1px solid var(--b)",borderRadius:"8px",padding:"13px 14px"}}>
                 <div style={{display:"flex",gap:"10px",marginBottom:"12px"}}>
                   <div style={{flex:1}}>
@@ -2182,20 +2417,23 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
                 )}
               </div>
             </div>
-            </>}
+            </div>
+            )}
 
-            {sectionsOf(sel).includes("events")&&<>
+            {sectionsOf(sel).includes("events")&&(
+            <div style={{order:sel.sections.indexOf("events")}} onDragOver={e=>e.preventDefault()} onDrop={()=>reorderSections(sel.id,draggedSection,"events")}>
             {/* Events — creating one here goes into the SAME Notion Calendar
                 the Calendar tab reads, so it just shows up there too, no
                 separate sync step. This section is the project's own view
                 of what it's got scheduled. */}
             <div style={{marginBottom:"24px"}}>
-              <SectionHeader label="EVENTS" onRemove={()=>removeSection(sel.id,"events")}/>
+              <SectionHeader label="EVENTS" onRemove={()=>removeSection(sel.id,"events")} onDragStart={()=>setDraggedSection("events")}
+                extra={<SortPicker value={liveSel.eventSort} options={EVENT_SORT_OPTIONS} onChange={key=>updateNode(sel.id,p=>({...p,eventSort:key}))}/>}/>
               <div style={{background:"var(--s1)",border:"1px solid var(--b)",borderRadius:"8px",overflow:"hidden",marginBottom:"8px"}}>
                 {(sel.events||[]).length===0&&!addingProjEvent&&(
                   <div style={{padding:"12px",fontSize:"11px",color:"var(--m)",fontStyle:"italic"}}>Nothing scheduled yet.</div>
                 )}
-                {(sel.events||[]).slice().sort((a,b)=>(a.date+((a.time)||""))<(b.date+((b.time)||""))?-1:1).map((ev,i,arr)=>{
+                {sortEvents(sel.events||[], sel.eventSort).map((ev,i,arr)=>{
                   const tc = (eventTypes.find(t=>t.name===ev.type)||{}).hex || "var(--teal)"
                   return(
                     <div key={ev.id} style={{display:"flex",alignItems:"center",gap:"9px",padding:"9px 13px",borderBottom:i<arr.length-1?"1px solid var(--b)":"none"}} className="hr">
@@ -2255,13 +2493,19 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
                 </button>
               )}
             </div>
-            </>}
+            </div>
+            )}
 
-            {sectionsOf(sel).includes("tasks")&&<>
+            {sectionsOf(sel).includes("tasks")&&(
+            <div style={{order:sel.sections.indexOf("tasks")}} onDragOver={e=>e.preventDefault()} onDrop={()=>reorderSections(sel.id,draggedSection,"tasks")}>
             {/* Tasks */}
             <div style={{marginBottom:"24px"}}>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"10px",flexWrap:"wrap",gap:"8px"}}>
                 <span className="hoverx" style={{display:"flex",alignItems:"center",gap:"6px"}}>
+                  <span draggable onDragStart={()=>setDraggedSection("tasks")} title="Drag to reorder" className="hoverx-btn"
+                    style={{cursor:"grab",display:"flex",color:"var(--m)"}}>
+                    <GripVertical size={11}/>
+                  </span>
                   <Eyebrow>TASKS</Eyebrow>
                   <button onClick={()=>removeSection(sel.id,"tasks")} title="Remove tasks section" className="hoverx-btn"
                     style={{background:"none",border:"none",cursor:"pointer",color:"var(--m)",padding:0,display:"flex"}}>
@@ -2269,6 +2513,8 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
                   </button>
                 </span>
                 <div style={{display:"flex",gap:"10px",alignItems:"center",flexWrap:"wrap"}}>
+                  <SortPicker value={liveSel.taskSort} options={TASK_SORT_OPTIONS}
+                    onChange={key=>updateNode(sel.id,p=>({...p,taskSort:key}))}/>
                   <div style={{display:"flex",gap:"4px"}}>
                     {["all","task","issue"].map(k=>(
                       <button key={k} onClick={()=>setTaskKindFilter(k)}
@@ -2406,80 +2652,132 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
               {taskView==="timeline"&&<GanttView tasks={visibleTasks} projId={sel.id} updateTask={updateTask}/>}
             </div>
 
-            </>}
+            </div>
+            )}
 
-            {sectionsOf(sel).includes("budget")&&<>
-            {/* Budget & Expenses — every project gets this for free, but nothing
-                forces its use. Expenses log independent of a budget; setting
-                one additionally turns on the spend-vs-budget math. */}
+            {sectionsOf(sel).includes("budget")&&(
+            <div style={{order:sel.sections.indexOf("budget")}} onDragOver={e=>e.preventDefault()} onDrop={()=>reorderSections(sel.id,draggedSection,"budget")}>
+            {/* Accounting — expenses AND revenue, running balance always
+                visible. Setting a budget additionally turns on spend-vs-cap
+                tracking (compared against expenses only, since a budget is
+                a spending limit, not a revenue target). */}
             <div style={{marginBottom:"24px"}}>
-              <SectionHeader label="BUDGET & EXPENSES" onRemove={()=>removeSection(sel.id,"budget")}/>
+              <SectionHeader label="ACCOUNTING" onRemove={()=>removeSection(sel.id,"budget")} onDragStart={()=>setDraggedSection("budget")}
+                extra={<SortPicker value={liveSel.ledgerSort} options={LEDGER_SORT_OPTIONS} onChange={key=>updateNode(sel.id,p=>({...p,ledgerSort:key}))}/>}/>
 
               <div style={{background:"var(--s1)",border:"1px solid var(--b)",borderRadius:"8px",padding:"14px",marginBottom:"10px"}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:bStats.hasBudget?"10px":0}}>
+                  <div>
+                    <Eyebrow style={{marginBottom:"2px"}}>BALANCE</Eyebrow>
+                    <span style={{fontFamily:"var(--mono)",fontSize:"18px",fontWeight:"600",
+                      color:bStats.balance>0?"var(--teal)":bStats.balance<0?"var(--red)":"var(--t)"}}>
+                      {bStats.balance<0?"-":""}£{Math.abs(bStats.balance).toFixed(2)}
+                    </span>
+                  </div>
+                  <div style={{textAlign:"right",fontSize:"10px",fontFamily:"var(--mono)",color:"var(--d)"}}>
+                    <div>+£{bStats.totalRevenue.toFixed(2)} revenue</div>
+                    <div>-£{bStats.totalExpense.toFixed(2)} expense</div>
+                  </div>
+                </div>
                 {bStats.hasBudget?(
                   <>
-                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"7px"}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"6px"}}>
                       <div style={{display:"flex",alignItems:"baseline",gap:"5px"}}>
-                        <span style={{fontFamily:"var(--mono)",fontSize:"13px",color:bStats.over?"var(--red)":"var(--t)"}}>£{bStats.spent.toFixed(2)}</span>
-                        <span style={{fontSize:"11px",color:"var(--d)"}}>of</span>
+                        <span style={{fontSize:"10px",color:"var(--m)"}}>spent</span>
+                        <span style={{fontFamily:"var(--mono)",fontSize:"11px",color:bStats.over?"var(--red)":"var(--d)"}}>£{bStats.totalExpense.toFixed(2)}</span>
+                        <span style={{fontSize:"10px",color:"var(--d)"}}>of</span>
                         <input type="number" step="1" defaultValue={bStats.budget}
                           onBlur={e=>setBudget(sel.id,Number(e.target.value)||0)}
-                          style={{width:"66px",background:"var(--s3)",border:"1px solid var(--b)",borderRadius:"3px",color:"var(--t)",
-                            fontFamily:"var(--mono)",fontSize:"12px",padding:"1px 5px"}}/>
+                          style={{width:"60px",background:"var(--s3)",border:"1px solid var(--b)",borderRadius:"3px",color:"var(--t)",
+                            fontFamily:"var(--mono)",fontSize:"11px",padding:"1px 5px"}}/>
+                        <span style={{fontSize:"10px",color:"var(--m)"}}>budget</span>
                       </div>
-                      <span style={{fontSize:"10px",fontFamily:"var(--mono)",color:bStats.over?"var(--red)":"var(--amber)"}}>
+                      <span style={{fontSize:"9px",fontFamily:"var(--mono)",color:bStats.over?"var(--red)":"var(--amber)"}}>
                         {bStats.pct}%{bStats.over?" over":""}
                       </span>
                     </div>
-                    <div style={{height:"6px",background:"var(--s3)",borderRadius:"3px",overflow:"hidden"}}>
+                    <div style={{height:"5px",background:"var(--s3)",borderRadius:"3px",overflow:"hidden"}}>
                       <div style={{height:"100%",width:Math.min(100,bStats.pct)+"%",
                         background:bStats.over?"var(--red)":"var(--amber)",transition:"width .2s"}}/>
                     </div>
                   </>
                 ):(
-                  <div style={{display:"flex",alignItems:"center",gap:"8px"}}>
-                    <Wallet size={13} color="var(--m)" strokeWidth={1.5}/>
-                    <span style={{fontSize:"11px",color:"var(--m)"}}>Total spent: £{bStats.spent.toFixed(2)}</span>
-                    <input type="number" placeholder="set a budget"
+                  <div style={{display:"flex",alignItems:"center",gap:"7px",marginTop:"4px"}}>
+                    <input type="number" placeholder="set a spend budget"
                       onBlur={e=>{const v=Number(e.target.value)||0;if(v>0) setBudget(sel.id,v)}}
-                      style={{width:"84px",background:"var(--s3)",border:"1px solid var(--b)",borderRadius:"3px",color:"var(--t)",
-                        fontFamily:"var(--mono)",fontSize:"12px",padding:"2px 6px"}}/>
-                    <span style={{fontSize:"10px",color:"var(--m)"}}>optional</span>
+                      style={{width:"110px",background:"var(--s3)",border:"1px solid var(--b)",borderRadius:"3px",color:"var(--t)",
+                        fontFamily:"var(--mono)",fontSize:"11px",padding:"3px 7px"}}/>
+                    <span style={{fontSize:"9px",color:"var(--m)"}}>optional</span>
                   </div>
                 )}
               </div>
 
               <div style={{background:"var(--s1)",border:"1px solid var(--b)",borderRadius:"8px",overflow:"hidden"}}>
-                <div style={{display:"grid",gridTemplateColumns:"1fr 90px 110px 22px",gap:"8px",padding:"7px 13px",
+                <div style={{display:"grid",gridTemplateColumns:"52px 1fr 44px 74px 78px 110px 22px",gap:"6px",padding:"7px 13px",
                   borderBottom:"1px solid var(--b)",fontSize:"9px",fontFamily:"var(--mono)",color:"var(--m)",letterSpacing:".06em"}}>
-                  <span>EXPENSE</span><span>AMOUNT</span><span>DATE</span><span/>
+                  <span/><span>LABEL</span><span>QTY</span><span>UNIT £</span><span>TOTAL £</span><span>DATE</span><span/>
                 </div>
-                {(sel.expenses||[]).map(exp=>(
-                  <div key={exp.id} style={{display:"grid",gridTemplateColumns:"1fr 90px 110px 22px",gap:"8px",alignItems:"center",
-                    padding:"6px 13px",borderBottom:"1px solid var(--b)"}} className="hr">
-                    <input defaultValue={exp.label} placeholder="label, link, or note" onBlur={e=>updateExpense(sel.id,exp.id,{label:e.target.value})}
-                      style={{background:"transparent",border:"none",color:"var(--t)",fontSize:"12px",outline:"none"}}/>
-                    <input type="number" step="0.01" defaultValue={exp.amount}
-                      onBlur={e=>updateExpense(sel.id,exp.id,{amount:Number(e.target.value)||0})}
-                      style={{background:"transparent",border:"none",color:"var(--amber)",fontFamily:"var(--mono)",fontSize:"11px",outline:"none",width:"100%"}}/>
-                    <input type="date" defaultValue={exp.date||""} onBlur={e=>updateExpense(sel.id,exp.id,{date:e.target.value||null})}
-                      style={{background:"transparent",border:"none",color:"var(--d)",fontFamily:"var(--mono)",fontSize:"10px",outline:"none",colorScheme:"dark"}}/>
-                    <button onClick={()=>deleteExpense(sel.id,exp.id)} style={{background:"none",border:"none",cursor:"pointer",color:"var(--m)",padding:0}}><X size={11}/></button>
-                  </div>
-                ))}
-                <div style={{padding:"7px 13px"}}>
-                  <button onClick={()=>addExpense(sel.id,{id:"e_"+Date.now(),label:"New expense",amount:0,date:ymd(new Date())})}
+                {sortLedger(sel.ledger||[], sel.ledgerSort).map(en=>{
+                  const isRevenue = en.kind==="revenue"
+                  const hasQty = en.quantity!=null && en.unitPrice!=null
+                  return(
+                    <div key={en.id} style={{display:"grid",gridTemplateColumns:"52px 1fr 44px 74px 78px 110px 22px",gap:"6px",alignItems:"center",
+                      padding:"6px 13px",borderBottom:"1px solid var(--b)"}} className="hr">
+                      <button onClick={()=>updateLedgerEntry(sel.id,en.id,{kind:isRevenue?"expense":"revenue"})}
+                        title={isRevenue?"Revenue — click to make this an expense":"Expense — click to make this revenue"}
+                        style={{fontSize:"9px",fontFamily:"var(--mono)",padding:"3px 6px",borderRadius:"4px",border:"1px solid",cursor:"pointer",
+                          borderColor:isRevenue?"var(--teal)":"var(--red)",
+                          background:isRevenue?"rgba(75,158,130,.12)":"rgba(224,85,85,.1)",
+                          color:isRevenue?"var(--teal)":"var(--red)"}}>
+                        {isRevenue?"+":"−"}
+                      </button>
+                      <input defaultValue={en.label} placeholder="label, link, or note" onBlur={e=>updateLedgerEntry(sel.id,en.id,{label:e.target.value})}
+                        style={{background:"transparent",border:"none",color:"var(--t)",fontSize:"12px",outline:"none",minWidth:0}}/>
+                      <input type="number" step="1" defaultValue={en.quantity??""} placeholder="—"
+                        onBlur={e=>{
+                          const q = e.target.value===""?null:Number(e.target.value)
+                          const changes = {quantity:q}
+                          if(q!=null && en.unitPrice!=null) changes.amount = q*en.unitPrice
+                          updateLedgerEntry(sel.id,en.id,changes)
+                        }}
+                        style={{background:"transparent",border:"none",color:"var(--d)",fontFamily:"var(--mono)",fontSize:"11px",outline:"none",width:"100%"}}/>
+                      <input type="number" step="0.01" defaultValue={en.unitPrice??""} placeholder="—"
+                        onBlur={e=>{
+                          const up = e.target.value===""?null:Number(e.target.value)
+                          const changes = {unitPrice:up}
+                          if(up!=null && en.quantity!=null) changes.amount = en.quantity*up
+                          updateLedgerEntry(sel.id,en.id,changes)
+                        }}
+                        style={{background:"transparent",border:"none",color:"var(--d)",fontFamily:"var(--mono)",fontSize:"11px",outline:"none",width:"100%"}}/>
+                      <input type="number" step="0.01" defaultValue={en.amount} readOnly={hasQty} title={hasQty?"Auto-calculated from qty × unit price":""}
+                        onBlur={e=>{ if(!hasQty) updateLedgerEntry(sel.id,en.id,{amount:Number(e.target.value)||0}) }}
+                        style={{background:"transparent",border:"none",color:isRevenue?"var(--teal)":"var(--amber)",fontFamily:"var(--mono)",
+                          fontSize:"11px",outline:"none",width:"100%",opacity:hasQty?0.75:1}}/>
+                      <input type="date" defaultValue={en.date||""} onBlur={e=>updateLedgerEntry(sel.id,en.id,{date:e.target.value||null})}
+                        style={{background:"transparent",border:"none",color:"var(--d)",fontFamily:"var(--mono)",fontSize:"10px",outline:"none",colorScheme:"dark"}}/>
+                      <button onClick={()=>deleteLedgerEntry(sel.id,en.id)} style={{background:"none",border:"none",cursor:"pointer",color:"var(--m)",padding:0}}><X size={11}/></button>
+                    </div>
+                  )
+                })}
+                <div style={{padding:"7px 13px",display:"flex",gap:"14px"}}>
+                  <button onClick={()=>addLedgerEntry(sel.id,{id:"le_"+Date.now(),label:"New expense",kind:"expense",quantity:null,unitPrice:null,amount:0,date:ymd(new Date())})}
                     style={{fontSize:"10px",fontFamily:"var(--mono)",color:"var(--d)",background:"none",border:"none",cursor:"pointer"}}>
                     + add expense
+                  </button>
+                  <button onClick={()=>addLedgerEntry(sel.id,{id:"le_"+Date.now(),label:"New revenue",kind:"revenue",quantity:null,unitPrice:null,amount:0,date:ymd(new Date())})}
+                    style={{fontSize:"10px",fontFamily:"var(--mono)",color:"var(--teal)",background:"none",border:"none",cursor:"pointer"}}>
+                    + add revenue
                   </button>
                 </div>
               </div>
             </div>
-            </>}
+            </div>
+            )}
 
-            {sectionsOf(sel).includes("resources")&&<>
+            {sectionsOf(sel).includes("resources")&&(
+            <div style={{order:sel.sections.indexOf("resources")}} onDragOver={e=>e.preventDefault()} onDrop={()=>reorderSections(sel.id,draggedSection,"resources")}>
             <div style={{marginBottom:"24px"}}>
-              <SectionHeader label="PEOPLE & RESOURCES" onRemove={()=>removeSection(sel.id,"resources")}/>
+              <SectionHeader label="PEOPLE & RESOURCES" onRemove={()=>removeSection(sel.id,"resources")} onDragStart={()=>setDraggedSection("resources")}/>
               <div style={{background:"var(--s1)",border:"1px solid var(--b)",borderRadius:"8px",overflow:"hidden"}}>
                 {(sel.resources||[]).length===0?(
                   <button onClick={()=>addResource(sel.id,{id:"r_"+Date.now(),name:"",role:""})}
@@ -2507,11 +2805,13 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
                 )}
               </div>
             </div>
-            </>}
+            </div>
+            )}
 
-            {sectionsOf(sel).includes("links")&&<>
+            {sectionsOf(sel).includes("links")&&(
+            <div style={{order:sel.sections.indexOf("links")}} onDragOver={e=>e.preventDefault()} onDrop={()=>reorderSections(sel.id,draggedSection,"links")}>
             <div style={{marginBottom:"24px"}}>
-              <SectionHeader label="LINKS" onRemove={()=>removeSection(sel.id,"links")}/>
+              <SectionHeader label="LINKS" onRemove={()=>removeSection(sel.id,"links")} onDragStart={()=>setDraggedSection("links")}/>
               <div style={{background:"var(--s1)",border:"1px solid var(--b)",borderRadius:"8px",overflow:"hidden"}}>
                 {(sel.links||[]).map((lk,i,arr)=>{
                   const isPreviewOpen = previewFor===lk.id
@@ -2583,21 +2883,25 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
                 </div>
               </div>
             </div>
-            </>}
+            </div>
+            )}
 
-            {sectionsOf(sel).includes("notes")&&<>
+            {sectionsOf(sel).includes("notes")&&(
+            <div style={{order:sel.sections.indexOf("notes")}} onDragOver={e=>e.preventDefault()} onDrop={()=>reorderSections(sel.id,draggedSection,"notes")}>
             <div style={{marginBottom:"24px"}}>
-              <SectionHeader label="NOTES" onRemove={()=>removeSection(sel.id,"notes")}/>
+              <SectionHeader label="NOTES" onRemove={()=>removeSection(sel.id,"notes")} onDragStart={()=>setDraggedSection("notes")}/>
               <textarea defaultValue={sel.notes||""} placeholder="Freeform notes for this project…"
                 onBlur={e=>updateNotes(sel.id,e.target.value)}
                 style={{width:"100%",minHeight:"110px",background:"var(--s1)",border:"1px solid var(--b)",borderRadius:"8px",
                   color:"var(--t)",fontSize:"13px",fontFamily:"var(--sans)",padding:"12px 13px",resize:"vertical",lineHeight:"1.6"}}/>
             </div>
-            </>}
+            </div>
+            )}
 
-            {sectionsOf(sel).includes("tables")&&<>
+            {sectionsOf(sel).includes("tables")&&(
+            <div style={{order:sel.sections.indexOf("tables")}} onDragOver={e=>e.preventDefault()} onDrop={()=>reorderSections(sel.id,draggedSection,"tables")}>
             <div style={{marginBottom:"24px"}}>
-              <SectionHeader label="TABLES" onRemove={()=>removeSection(sel.id,"tables")}/>
+              <SectionHeader label="TABLES" onRemove={()=>removeSection(sel.id,"tables")} onDragStart={()=>setDraggedSection("tables")}/>
               {(sel.tables||[]).map(tb=>(
                 <div key={tb.id} style={{background:"var(--s1)",border:"1px solid var(--b)",borderRadius:"8px",overflow:"hidden",marginBottom:"10px"}}>
                   <div style={{display:"flex",alignItems:"center",gap:"8px",padding:"8px 12px",borderBottom:"1px solid var(--b)"}}>
@@ -2650,11 +2954,13 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
                 + add table
               </button>
             </div>
-            </>}
+            </div>
+            )}
 
-            {sectionsOf(sel).includes("charts")&&<>
+            {sectionsOf(sel).includes("charts")&&(
+            <div style={{order:sel.sections.indexOf("charts")}} onDragOver={e=>e.preventDefault()} onDrop={()=>reorderSections(sel.id,draggedSection,"charts")}>
             <div style={{marginBottom:"24px"}}>
-              <SectionHeader label="CHARTS" onRemove={()=>removeSection(sel.id,"charts")}/>
+              <SectionHeader label="CHARTS" onRemove={()=>removeSection(sel.id,"charts")} onDragStart={()=>setDraggedSection("charts")}/>
               {(sel.charts||[]).map(ch=>{
                 const tb=(sel.tables||[]).find(t=>t.id===ch.tableId)
                 const labelIdx=tb?tb.cols.indexOf(ch.labelCol):-1
@@ -2705,14 +3011,20 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
                 + add chart
               </button>
             </div>
-            </>}
+            </div>
+            )}
 
-            {sectionsOf(sel).includes("files")&&<>
+            {sectionsOf(sel).includes("files")&&(
+            <div style={{order:sel.sections.indexOf("files")}} onDragOver={e=>e.preventDefault()} onDrop={()=>reorderSections(sel.id,draggedSection,"files")}>
 
             {/* Files */}
             <div>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"10px"}}>
                 <span className="hoverx" style={{display:"flex",alignItems:"center",gap:"6px"}}>
+                  <span draggable onDragStart={()=>setDraggedSection("files")} title="Drag to reorder" className="hoverx-btn"
+                    style={{cursor:"grab",display:"flex",color:"var(--m)"}}>
+                    <GripVertical size={11}/>
+                  </span>
                   <Eyebrow>FILES & POINTERS</Eyebrow>
                   <button onClick={()=>removeSection(sel.id,"files")} title="Remove files section" className="hoverx-btn"
                     style={{background:"none",border:"none",cursor:"pointer",color:"var(--m)",padding:0,display:"flex"}}>
@@ -2752,7 +3064,11 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
                 })}
               </div>
             </div>
-            </>}
+            </div>
+            )}
+
+            </div>
+            {/* end of drag-orderable sections */}
 
             {/* Section manager — add what's missing, remove what isn't in
                 use. Removing never deletes data, only hides it, so this is
@@ -3082,6 +3398,15 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
     const [dragSel,setDragSel]=useState(null)        // {startMin,endMin} while dragging, null otherwise
     const dragStartRef=useRef(null)
     const gridRef=useRef(null)
+    // ── Schedule import — CSV or XLSX, multi-step: pick file -> pick sheet
+    // (XLSX can have several) -> map columns to event fields -> confirm ->
+    // creates real Notion Calendar events, one per row, so imported rows
+    // show up exactly like any other event everywhere in the app.
+    const [importStep,setImportStep]=useState(null)  // null | "extracting" | "preview" | "importing" | "done"
+    const [importWorkbook,setImportWorkbook]=useState(null)
+    const [importRows,setImportRows]=useState([])              // extracted events once Gemini has parsed the file
+    const [importProgress,setImportProgress]=useState({done:0,total:0,failed:0})
+    const importFileRef=useRef(null)
 
     async function saveEditField(changes){
       if(!editEvent?.id) return
@@ -3185,6 +3510,101 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
     const allEvents=[...timetableSessions,...notionEvents]
     const fmt=d=>d.toLocaleDateString("en-GB",{day:"numeric",month:"short"})
 
+    // ── Schedule import pipeline ─────────────────────────────────────────
+    function parseCSV(text){
+      // Simple but real CSV parser — handles quoted fields containing commas,
+      // which a naive text.split(",") would break on.
+      const rows=[]
+      let row=[], field="", inQuotes=false
+      for(let i=0;i<text.length;i++){
+        const c=text[i]
+        if(inQuotes){
+          if(c==='"'){ if(text[i+1]==='"'){field+='"';i++} else inQuotes=false }
+          else field+=c
+        }else{
+          if(c==='"') inQuotes=true
+          else if(c===','){ row.push(field); field="" }
+          else if(c==='\n'||c==='\r'){ if(field||row.length){row.push(field);rows.push(row);row=[];field=""} }
+          else field+=c
+        }
+      }
+      if(field||row.length){ row.push(field); rows.push(row) }
+      return rows.filter(r=>r.some(f=>f.trim()!==""))
+    }
+    // Turn a raw workbook (every sheet, whatever shape) into a compact text
+    // dump Gemini can read — this is what replaces manual column-mapping.
+    // Instead of asking the user which column is "date", Gemini looks at
+    // the actual content of every sheet and figures out what's schedulable.
+    function workbookToText(wb){
+      let out=""
+      for(const name of wb.SheetNames){
+        const rows = XLSX.utils.sheet_to_json(wb.Sheets[name], {header:1, raw:false, dateNF:"yyyy-mm-dd", defval:""})
+          .filter(r=>r.some(c=>String(c).trim()!==""))
+        if(!rows.length) continue
+        out += `\n--- Sheet: ${name} ---\n`
+        out += rows.slice(0,200).map(r=>r.join(" | ")).join("\n")   // cap rows per sheet — plenty for a schedule
+      }
+      return out.slice(0,50000)   // cap total size sent to Gemini
+    }
+    function handleImportFile(file){
+      const isXlsx = /\.xlsx?$/i.test(file.name)
+      const reader = new FileReader()
+      reader.onload = async ()=>{
+        let rawText
+        if(isXlsx){
+          const wb = XLSX.read(reader.result, {type:"binary", cellDates:true})
+          rawText = workbookToText(wb)
+        }else{
+          rawText = reader.result.slice(0,50000)
+        }
+        if(!rawText.trim()){ flash("Couldn't find any data in that file.","warn"); return }
+        await extractWithGemini(rawText)
+      }
+      if(isXlsx) reader.readAsBinaryString(file); else reader.readAsText(file)
+    }
+    // The actual "flexible, any format" piece — gemini-2.5-flash reads the
+    // raw dump (whatever sheets, whatever column names, however messy) and
+    // returns a clean, normalized event list. No mapping UI, no assuming a
+    // fixed shape — it just looks at the content and decides what's a
+    // schedulable event versus a pricing table or inventory list.
+    async function extractWithGemini(rawText){
+      if(!apiBase || !creds.some(c=>c.service==="gemini")){ setTab("settings"); flash("Connect Gemini in Settings first.","warn"); return }
+      setImportStep("extracting")
+      try{
+        const raw = await gemini(apiBase, me?.deployment?.relay_token,
+          "You extract schedulable calendar events from raw, messy spreadsheet dumps that may contain multiple unrelated sheets (pricing tables, inventory, financial summaries, etc alongside real schedule data). Only extract rows that clearly represent a dated task, event, or deliverable. Ignore anything without a real date. Infer a short event type from context (e.g. Shoot, Launch, Marketing, Logistics, Meeting) — don't force everything into one type.",
+          `Raw spreadsheet content:\n${rawText}\n\nReturn ONLY this JSON, no markdown fences: {"events":[{"title":"","date":"YYYY-MM-DD","type":"","notes":""}]}`
+        )
+        const clean = raw.replace(/^```json\s*/i,"").replace(/^```\s*/i,"").replace(/```\s*$/i,"").trim()
+        const parsed = JSON.parse(clean)
+        const events = (parsed.events||[]).filter(e=>e.title && /^\d{4}-\d{2}-\d{2}$/.test(e.date||""))
+        if(!events.length){ flash("Gemini couldn't find any clearly-dated events in that file.","warn"); setImportStep(null); return }
+        setImportRows(events)
+        setImportStep("preview")
+      }catch(e){ flash("Extraction failed: "+e.message,"warn"); setImportStep(null) }
+    }
+    async function runImport(){
+      setImportStep("importing")
+      setImportProgress({done:0,total:importRows.length,failed:0})
+      let failed=0
+      for(const ev of importRows){
+        try{
+          await notionCalCreate({ title:ev.title, date:ev.date, type:ev.type||"Event", notes:ev.notes||"" })
+        }catch{ failed++ }
+        setImportProgress(p=>({...p,done:p.done+1}))
+        await new Promise(r=>setTimeout(r,350))   // pace requests — Notion's API has real rate limits
+      }
+      setImportProgress(p=>({...p,failed}))
+      setImportStep("done")
+      const start=ymd(weekStart),end=ymd(addD(weekStart,8))
+      notionCalQuery(start,end).then(setNotionEvents).catch(()=>{})
+    }
+    function closeImport(){
+      setImportStep(null); setImportWorkbook(null); setImportRows([])
+      if(importFileRef.current) importFileRef.current.value=""
+    }
+
+
     async function submitAdd(e){
       e.preventDefault()
       if(!addForm.title||!addForm.date){setAddMsg("Title and date are required.");return}
@@ -3231,6 +3651,11 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
             ))}
           </div>
           <button onClick={()=>setAddOpen(true)} style={{background:"var(--amber)",color:"#000",border:"none",borderRadius:"5px",padding:"6px 12px",cursor:"pointer",fontSize:"11px",fontWeight:"600",fontFamily:"var(--mono)"}}>+ event</button>
+          <label style={{fontSize:"10px",fontFamily:"var(--mono)",color:"var(--d)",background:"var(--s2)",border:"1px solid var(--b)",borderRadius:"4px",padding:"5px 9px",cursor:"pointer"}}>
+            import schedule
+            <input ref={importFileRef} type="file" accept=".csv,.xlsx,.xls" style={{display:"none"}}
+              onChange={e=>{ const f=e.target.files?.[0]; if(f) handleImportFile(f) }}/>
+          </label>
           <a href={NOTION_CAL_URL} target="_blank" rel="noreferrer" style={{fontSize:"10px",fontFamily:"var(--mono)",color:"var(--d)",textDecoration:"none",border:"1px solid var(--b)",borderRadius:"4px",padding:"5px 9px"}}>notion ↗</a>
         </div>
 
@@ -3388,6 +3813,77 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
                 style={{width:"100%",background:"none",border:"1px solid rgba(224,85,85,.35)",color:"#e05555",borderRadius:"6px",padding:"8px",cursor:"pointer",fontSize:"11px",fontFamily:"var(--mono)"}}>
                 delete event
               </button>
+            </div>
+          </div>
+        )}
+
+        {/* Schedule import — file already picked, walks through extracting
+            (Gemini reads the raw dump), preview (what it found), importing
+            (creating real Notion Calendar events), done. */}
+        {importStep&&(
+          <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.75)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}}
+            onClick={()=>importStep!=="importing"&&closeImport()}>
+            <div onClick={e=>e.stopPropagation()} style={{background:"var(--s1)",border:"1px solid var(--b)",borderRadius:"10px",padding:"20px",width:"440px",maxHeight:"80vh",overflowY:"auto"}} className="fi">
+
+              {importStep==="extracting"&&(
+                <div style={{textAlign:"center",padding:"20px 0"}}>
+                  <div style={{display:"inline-flex",alignItems:"center",gap:"6px",fontSize:"10px",fontFamily:"var(--mono)",
+                    color:"var(--teal)",background:"rgba(75,158,130,.1)",border:"1px solid rgba(75,158,130,.3)",
+                    borderRadius:"999px",padding:"4px 11px",marginBottom:"14px"}}>
+                    <Sparkles size={10}/> using gemini flash
+                  </div>
+                  <div style={{fontSize:"12px",color:"var(--d)"}}>Reading your file and picking out anything schedulable…</div>
+                </div>
+              )}
+
+              {importStep==="preview"&&(
+                <>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"4px"}}>
+                    <Eyebrow>FOUND {importRows.length} EVENT{importRows.length!==1?"S":""}</Eyebrow>
+                    <button onClick={closeImport} style={{background:"none",border:"none",cursor:"pointer",color:"var(--m)",padding:0,display:"flex"}}><X size={14}/></button>
+                  </div>
+                  <div style={{fontSize:"10px",color:"var(--m)",marginBottom:"12px"}}>Remove anything that isn't right before importing — nothing's created yet.</div>
+                  <div style={{display:"flex",flexDirection:"column",gap:"4px",marginBottom:"14px"}}>
+                    {importRows.map((ev,i)=>(
+                      <div key={i} style={{display:"flex",alignItems:"center",gap:"8px",background:"var(--s2)",borderRadius:"6px",padding:"7px 10px"}}>
+                        <div style={{flex:1,minWidth:0}}>
+                          <div style={{fontSize:"11px",color:"var(--t)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{ev.title}</div>
+                          <div style={{fontSize:"9px",fontFamily:"var(--mono)",color:"var(--m)"}}>{ev.date}{ev.type?" · "+ev.type:""}</div>
+                        </div>
+                        <button onClick={()=>setImportRows(r=>r.filter((_,idx)=>idx!==i))}
+                          style={{background:"none",border:"none",cursor:"pointer",color:"var(--m)",padding:0,flexShrink:0}}><X size={11}/></button>
+                      </div>
+                    ))}
+                  </div>
+                  <button onClick={runImport} disabled={!importRows.length}
+                    style={{width:"100%",background:"var(--amber)",color:"#000",border:"none",borderRadius:"6px",padding:"9px",cursor:"pointer",fontSize:"12px",fontWeight:"600",opacity:importRows.length?1:.5}}>
+                    Import {importRows.length} event{importRows.length!==1?"s":""}
+                  </button>
+                </>
+              )}
+
+              {importStep==="importing"&&(
+                <div style={{padding:"10px 0"}}>
+                  <Eyebrow style={{marginBottom:"10px"}}>IMPORTING…</Eyebrow>
+                  <div style={{height:"6px",background:"var(--s3)",borderRadius:"3px",overflow:"hidden",marginBottom:"8px"}}>
+                    <div style={{height:"100%",width:(importProgress.done/Math.max(1,importProgress.total)*100)+"%",background:"var(--amber)",transition:"width .2s"}}/>
+                  </div>
+                  <div style={{fontSize:"10px",fontFamily:"var(--mono)",color:"var(--d)",textAlign:"center"}}>{importProgress.done} / {importProgress.total}</div>
+                </div>
+              )}
+
+              {importStep==="done"&&(
+                <div style={{textAlign:"center",padding:"14px 0"}}>
+                  <div style={{fontSize:"13px",color:"var(--t)",marginBottom:"6px"}}>
+                    Imported {importProgress.total-importProgress.failed} of {importProgress.total} events
+                  </div>
+                  {importProgress.failed>0&&<div style={{fontSize:"10px",color:"var(--amber)",marginBottom:"12px"}}>{importProgress.failed} couldn't be created — try those manually.</div>}
+                  <button onClick={closeImport}
+                    style={{background:"var(--amber)",color:"#000",border:"none",borderRadius:"6px",padding:"8px 20px",cursor:"pointer",fontSize:"12px",fontWeight:"600"}}>
+                    Done
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -4428,6 +4924,57 @@ Be smart: fuzzy-match project titles to IDs, infer categories and types intellig
                     style={{fontSize:"10px",fontFamily:"var(--mono)",color:"var(--red)",background:"none",border:"1px solid var(--b)",borderRadius:"4px",padding:"5px 10px",cursor:"pointer"}}>
                     delete account
                   </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Data backup — your projects/pages live in THIS browser's
+                storage only. Nothing else backs them up unless a project is
+                synced to Notion. This is the real safety net: a file you
+                can keep, and use to restore on a new device or browser. */}
+            <div style={{marginBottom:"24px"}}>
+              <Eyebrow style={{marginBottom:"10px"}}>DATA BACKUP</Eyebrow>
+              <div style={{background:"var(--s1)",border:"1px solid var(--b)",borderRadius:"8px",padding:"12px 14px"}}>
+                <div style={{fontSize:"10px",color:"var(--d)",lineHeight:"1.6",marginBottom:"10px"}}>
+                  Your projects and pages are stored in this browser only — an app update never touches them,
+                  but clearing browser data, switching devices, or using a private window would. Export a backup
+                  now and then, and you can restore it anywhere.
+                </div>
+                <div style={{display:"flex",gap:"8px"}}>
+                  <button onClick={()=>{
+                      const data = localStorage.getItem(LS_KEY)||"{}"
+                      const blob = new Blob([data], {type:"application/json"})
+                      const url = URL.createObjectURL(blob)
+                      const a = document.createElement("a")
+                      a.href = url
+                      a.download = `lifeos-backup-${ymd(new Date())}.json`
+                      a.click()
+                      URL.revokeObjectURL(url)
+                    }}
+                    style={{fontSize:"10px",fontFamily:"var(--mono)",color:"#000",background:"var(--amber)",border:"none",borderRadius:"5px",padding:"7px 14px",cursor:"pointer",fontWeight:"600"}}>
+                    export backup
+                  </button>
+                  <label style={{fontSize:"10px",fontFamily:"var(--mono)",color:"var(--d)",background:"var(--s2)",border:"1px solid var(--b)",borderRadius:"5px",padding:"7px 14px",cursor:"pointer"}}>
+                    import backup
+                    <input type="file" accept="application/json" style={{display:"none"}}
+                      onChange={e=>{
+                        const file = e.target.files?.[0]
+                        if(!file) return
+                        const reader = new FileReader()
+                        reader.onload = ()=>{
+                          try{
+                            const parsed = JSON.parse(reader.result)
+                            if(!parsed.projects) throw new Error("Doesn't look like a LifeOS backup file.")
+                            if(!confirm(`This will replace everything currently in the app with the backup from this file (${parsed.projects.length} project(s)). Continue?`)) return
+                            localStorage.setItem(LS_KEY, JSON.stringify(parsed))
+                            alert("Restored — reloading now.")
+                            window.location.reload()
+                          }catch(err){ alert("Couldn't read that file: "+err.message) }
+                        }
+                        reader.readAsText(file)
+                        e.target.value = ""
+                      }}/>
+                  </label>
                 </div>
               </div>
             </div>
